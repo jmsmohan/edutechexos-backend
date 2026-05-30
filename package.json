@@ -5,13 +5,14 @@
   "license": "MIT",
   "scripts": {
     "build": "echo \"No build needed\"",
-    "start": "node server.js",
-    "postinstall": "npm install mongoose@^7.5.0"
+    "start": "node server.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
+    "dotenv": "^16.0.0",
     "express": "^4.18.2",
-    "socket.io": "^4.7.2",
-    "mongoose": "^7.5.0"
+    "mongoose": "^7.5.0",
+    "nodemailer": "^6.9.0",
+    "socket.io": "^4.7.2"
   }
 }
