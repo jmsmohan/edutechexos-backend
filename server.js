@@ -1,10 +1,37 @@
+const dns = require('dns');
+// Override system DNS with Google's public resolvers to fix querySrv ECONNREFUSED
+// on networks where the local DNS server blocks or misroutes SRV lookups.
+try { dns.setServers(['8.8.8.8', '8.8.4.4', '1.1.1.1']); } catch (_) {}
+
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const mongoose = require('mongoose');
 const cors = require('cors');
-const nodemailer = require('nodemailer');
+// nodemailer replaced by Brevo HTTP API (no IP-whitelist issues)
+const jwt = require('jsonwebtoken');
 require('dotenv').config({ path: require('path').join(__dirname, '.env') });
+
+const JWT_SECRET = process.env.JWT_SECRET || 'edutechexos-jwt-secret-2026';
+const JWT_EXPIRY = '7d';
+
+// ── Brevo HTTP API helper (no SMTP / no IP whitelist needed) ─────────────────
+async function sendBrevoEmail({ to, subject, html }) {
+  const apiKey = process.env.BREVO_API_KEY;
+  if (!apiKey) { console.error('[Brevo] BREVO_API_KEY not set'); return { ok: false }; }
+
+  const fromRaw  = process.env.SMTP_FROM || 'EduTechExOS <edutechexos121@gmail.com>';
+  const fromEmail = (fromRaw.match(/<(.+)>/) || [])[1] || fromRaw.trim();
+  const fromName  = fromRaw.replace(/<.*>/, '').trim() || 'EduTechExOS';
+
+  const res = await fetch('https://api.brevo.com/v3/smtp/email', {
+    method: 'POST',
+    headers: { 'api-key': apiKey, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sender: { name: fromName, email: fromEmail }, to, subject, htmlContent: html }),
+  });
+  if (!res.ok) { const b = await res.text(); console.error('[Brevo]', res.status, b); return { ok: false }; }
+  return { ok: true };
+}
 
 const app = express();
 const httpServer = http.createServer(app);
@@ -14,8 +41,7 @@ const ALLOWED_ORIGINS = [
   'https://edutechexos.vercel.app',
 
   /\.vercel\.app$/,           // any Vercel preview deploy
-  'http://localhost:3000',
-  'http://localhost:10006',
+  /^http:\/\/localhost(:\d+)?$/,  // any localhost port (dev)
 ];
 
 // Socket.IO server — same CORS rules as Express
@@ -91,6 +117,7 @@ const MessageSchema = new mongoose.Schema(
     clientId:    { type: String },
     channelId:   { type: String, required: true, index: true },
     sender:      { type: String, required: true },
+    senderEmail: { type: String, index: true },
     initials:    { type: String, required: true },
     color:       { type: String, required: true },
     text:        { type: String, required: true },
@@ -145,6 +172,7 @@ const KanbanTaskSchema = new mongoose.Schema(
   {
     text:             { type: String, required: true },
     assignee:         { type: String, required: true },
+    assigneeEmail:    { type: String, index: true },
     assigneeInitials: { type: String, required: true },
     sourceChannel:    { type: String, required: true },
     status:           { type: String, enum: ['todo', 'inprogress', 'done'], default: 'todo' },
@@ -159,10 +187,23 @@ const WikiPageSchema = new mongoose.Schema({
   channelId: { type: String, required: true, index: true },
   title: { type: String, required: true },
   content: { type: String, required: true },
+  createdBy: { type: String, index: true },
 }, {
   timestamps: true
 });
 const WikiPage = mongoose.model('WikiPage', WikiPageSchema);
+
+// Bookmark schema — persisted per-user on backend
+const BookmarkSchema = new mongoose.Schema({
+  userEmail: { type: String, required: true, index: true },
+  messageId: { type: String, required: true },
+  channelId: { type: String, required: true },
+  text:      { type: String, default: '' },
+  sender:    { type: String, default: '' },
+  timestamp: { type: Date, default: Date.now },
+}, { timestamps: true });
+BookmarkSchema.index({ userEmail: 1, messageId: 1 }, { unique: true });
+const Bookmark = mongoose.model('Bookmark', BookmarkSchema);
 
 const NotificationSchema = new mongoose.Schema({
   type: { type: String, default: 'mention' },
@@ -176,12 +217,38 @@ const NotificationSchema = new mongoose.Schema({
 });
 const Notification = mongoose.model('Notification', NotificationSchema);
 
+// ── Auth middleware ──────────────────────────────────────────────────────────
+function authMiddleware(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    try {
+      const token = authHeader.slice(7);
+      const decoded = jwt.verify(token, JWT_SECRET);
+      req.user = decoded; // { email, name, role }
+    } catch (err) {
+      // Token invalid — continue without auth, will fall back to query params
+    }
+  }
+  next();
+}
+
+function getUserEmail(req) {
+  // Prefer JWT-authenticated user, fall back to query/body param
+  if (req.user && req.user.email) return req.user.email.toLowerCase();
+  if (req.query.userEmail) return String(req.query.userEmail).toLowerCase();
+  if (req.body && req.body.userEmail) return String(req.body.userEmail).toLowerCase();
+  return null;
+}
+
 // --- 3. API Endpoints ---
 
 // Health Check
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', time: new Date().toISOString() });
 });
+
+// Apply auth middleware to all /api/* routes except auth endpoints
+app.use(/^\/api\/(?!auth\/|access-requests|digest|health).*/, authMiddleware);
 
 // ─── Auth Routes ──────────────────────────────────────────────────────────────
 
@@ -290,7 +357,12 @@ app.post('/api/auth/login', async (req, res) => {
     // 1. Check hardcoded accounts first
     const hardcoded = VALID_ACCOUNTS.find((a) => a.email === emailClean && a.password === password);
     if (hardcoded) {
-      return res.json({ success: true, user: hardcoded });
+      const token = jwt.sign(
+        { email: hardcoded.email, name: hardcoded.name, role: hardcoded.role },
+        JWT_SECRET,
+        { expiresIn: JWT_EXPIRY }
+      );
+      return res.json({ success: true, user: hardcoded, token });
     }
 
     // 2. Check DB access requests
@@ -310,65 +382,42 @@ app.post('/api/auth/login', async (req, res) => {
     }
 
     // Approved ✓
+    const token = jwt.sign(
+      { email: request.email, name: request.name, role: request.role },
+      JWT_SECRET,
+      { expiresIn: JWT_EXPIRY }
+    );
     return res.json({
       success: true,
       user: { email: request.email, name: request.name, role: request.role },
+      token,
     });
   } catch (err) {
     res.status(500).json({ success: false, error: String(err) });
   }
 });
 
-// ── Helper: send password-reset email (Ethereal fallback when SMTP not set) ──
+// ── Helper: send password-reset email via Brevo API ──────────────────────────
 async function sendResetEmail(toEmail, toName, code) {
-  let host = process.env.SMTP_HOST;
-  let port = Number(process.env.SMTP_PORT) || 587;
-  let secure = process.env.SMTP_SECURE === 'true';
-  let user = process.env.SMTP_USER;
-  let pass = process.env.SMTP_PASS;
-  let from = process.env.SMTP_FROM || '"EduTechExOS" <noreply@edutechex.in>';
-  let testUrl = '';
-
-  if (!host || !user || !pass) {
-    const testAccount = await nodemailer.createTestAccount();
-    host = 'smtp.ethereal.email';
-    port = 587;
-    secure = false;
-    user = testAccount.user;
-    pass = testAccount.pass;
-    from = `"EduTechExOS" <${testAccount.user}>`;
-  }
-
-  const transporter = nodemailer.createTransport({ host, port, secure, auth: { user, pass } });
-
-  const info = await transporter.sendMail({
-    from,
-    to: toEmail,
-    subject: `EduTechExOS: Password reset code ${code}`,
-    html: `
-      <div style="font-family:Arial,sans-serif;background:#f8fafc;padding:32px;">
-        <div style="max-width:520px;margin:0 auto;background:#fff;border:1px solid #e2e8f0;border-radius:18px;overflow:hidden;">
-          <div style="background:linear-gradient(135deg,#4f46e5,#3b82f6);color:#fff;padding:24px 28px;">
-            <h1 style="margin:0;font-size:22px;">EduTechEx<span style="color:#93c5fd;">OS</span></h1>
-            <p style="margin:6px 0 0;color:#e0e7ff;font-size:13px;letter-spacing:1px;text-transform:uppercase;">Password Reset</p>
-          </div>
-          <div style="padding:28px;">
-            <p style="margin:0 0 16px;color:#334155;font-size:15px;">Hello ${toName},</p>
-            <p style="margin:0 0 20px;color:#334155;font-size:15px;">We received a request to reset your EduTechExOS password. Use the code below — it expires in <strong>15 minutes</strong>.</p>
-            <div style="letter-spacing:8px;font-size:32px;font-weight:800;color:#4f46e5;background:#eef2ff;border-radius:14px;padding:18px;text-align:center;margin-bottom:24px;">${code}</div>
-            <p style="margin:0;color:#64748b;font-size:13px;">If you didn't request a password reset, you can safely ignore this email.</p>
-          </div>
-          <div style="background:#f8fafc;padding:16px 28px;border-top:1px solid #f1f5f9;text-align:center;font-size:11px;color:#94a3b8;text-transform:uppercase;letter-spacing:1px;">&copy; 2026 EduTechExOS &middot; Internal Team OS</div>
+  const html = `
+    <div style="font-family:Arial,sans-serif;background:#f8fafc;padding:32px;">
+      <div style="max-width:520px;margin:0 auto;background:#fff;border:1px solid #e2e8f0;border-radius:18px;overflow:hidden;">
+        <div style="background:linear-gradient(135deg,#4f46e5,#3b82f6);color:#fff;padding:24px 28px;">
+          <h1 style="margin:0;font-size:22px;">EduTechEx<span style="color:#93c5fd;">OS</span></h1>
+          <p style="margin:6px 0 0;color:#e0e7ff;font-size:13px;letter-spacing:1px;text-transform:uppercase;">Password Reset</p>
         </div>
+        <div style="padding:28px;">
+          <p style="margin:0 0 16px;color:#334155;font-size:15px;">Hello ${toName},</p>
+          <p style="margin:0 0 20px;color:#334155;font-size:15px;">Use the code below to reset your password — it expires in <strong>15 minutes</strong>.</p>
+          <div style="letter-spacing:8px;font-size:32px;font-weight:800;color:#4f46e5;background:#eef2ff;border-radius:14px;padding:18px;text-align:center;margin-bottom:24px;">${code}</div>
+          <p style="margin:0;color:#64748b;font-size:13px;">If you didn't request this, ignore this email.</p>
+        </div>
+        <div style="background:#f8fafc;padding:16px 28px;border-top:1px solid #f1f5f9;text-align:center;font-size:11px;color:#94a3b8;text-transform:uppercase;letter-spacing:1px;">&copy; 2026 EduTechExOS</div>
       </div>
-    `,
-  });
+    </div>`;
 
-  if (host === 'smtp.ethereal.email') {
-    testUrl = nodemailer.getTestMessageUrl(info) || '';
-    console.log(`[reset-email] Ethereal preview: ${testUrl}`);
-  }
-  return { testUrl };
+  const { ok } = await sendBrevoEmail({ to: [{ email: toEmail, name: toName }], subject: `EduTechExOS: Password reset code ${code}`, html });
+  return { ok };
 }
 
 // POST /api/auth/forgot-password — generate + email a 6-digit reset code
@@ -479,21 +528,170 @@ app.post('/api/auth/change-password', async (req, res) => {
   }
 });
 
+// ─── Email Digest ─────────────────────────────────────────────────────────────
+//
+// Builds and sends a daily digest email to all team members covering:
+//  • Message count per channel (last 24 h)
+//  • Open Kanban tasks
+//  • Upcoming scheduled meetings
+//
+// POST /api/digest  — trigger manually (admin use / testing)
+// Cron             — fires automatically every day at 09:00 IST (03:30 UTC)
+
+async function buildDigestHtml(since) {
+  const sinceDate = since || new Date(Date.now() - 24 * 60 * 60 * 1000);
+
+  // Recent messages grouped by channel
+  const recentMsgs = await Message.find({ timestamp: { $gte: sinceDate } }).lean();
+  const byChannel = {};
+  recentMsgs.forEach((m) => {
+    byChannel[m.channelId] = (byChannel[m.channelId] || 0) + 1;
+  });
+  const channelRows = Object.entries(byChannel)
+    .sort(([, a], [, b]) => b - a)
+    .map(([ch, cnt]) => `<tr><td style="padding:6px 12px;border-bottom:1px solid #f1f5f9;">#${ch}</td><td style="padding:6px 12px;border-bottom:1px solid #f1f5f9;font-weight:700;color:#4f46e5;">${cnt}</td></tr>`)
+    .join('');
+
+  // Open Kanban tasks
+  const openTasks = await KanbanTask.find({ status: { $ne: 'done' } }).lean();
+  const taskRows = openTasks.slice(0, 10)
+    .map((t) => `<tr><td style="padding:6px 12px;border-bottom:1px solid #f1f5f9;">${t.text.slice(0, 80)}</td><td style="padding:6px 12px;border-bottom:1px solid #f1f5f9;">${t.assignee}</td><td style="padding:6px 12px;border-bottom:1px solid #f1f5f9;"><span style="background:${t.status==='inprogress'?'#dbeafe':'#fef9c3'};color:${t.status==='inprogress'?'#1d4ed8':'#854d0e'};padding:2px 8px;border-radius:999px;font-size:11px;font-weight:700;">${t.status}</span></td></tr>`)
+    .join('');
+
+  // Upcoming meetings (messages starting with "Meeting Scheduled:")
+  const upcomingMeetings = await Message.find({ text: /^Meeting Scheduled:/, timestamp: { $gte: sinceDate } }).lean();
+  const meetingRows = upcomingMeetings
+    .map((m) => {
+      const title = (m.text.match(/Meeting Scheduled:\s*(.+)/) || [])[1] || 'Meeting';
+      const time  = (m.text.match(/Time:\s*(.+)/)             || [])[1] || '';
+      const link  = (m.text.match(/Join Link:\s*(https?:\/\/\S+)/) || [])[1] || '#';
+      return `<tr><td style="padding:6px 12px;border-bottom:1px solid #f1f5f9;">${title}</td><td style="padding:6px 12px;border-bottom:1px solid #f1f5f9;">${time}</td><td style="padding:6px 12px;border-bottom:1px solid #f1f5f9;"><a href="${link}" style="color:#4f46e5;font-weight:700;">Join →</a></td></tr>`;
+    })
+    .join('');
+
+  const dateLabel = sinceDate.toLocaleDateString('en-IN', { day: 'numeric', month: 'long', year: 'numeric' });
+
+  return `
+  <div style="font-family:Inter,Arial,sans-serif;background:#f8fafc;padding:32px;">
+    <div style="max-width:560px;margin:0 auto;background:#fff;border:1px solid #e2e8f0;border-radius:20px;overflow:hidden;">
+      <!-- Header -->
+      <div style="background:linear-gradient(135deg,#1a3a2a,#4f46e5);padding:24px 28px;">
+        <p style="margin:0;color:#a5f3fc;font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;">EduTechExOS</p>
+        <h1 style="margin:6px 0 0;font-size:22px;color:#fff;">Daily Digest</h1>
+        <p style="margin:4px 0 0;color:#c7d2fe;font-size:13px;">${dateLabel}</p>
+      </div>
+
+      <!-- Channel activity -->
+      <div style="padding:24px 28px 0;">
+        <h2 style="margin:0 0 12px;font-size:14px;font-weight:800;color:#1e293b;text-transform:uppercase;letter-spacing:1px;">📣 Channel Activity (last 24 h)</h2>
+        ${channelRows ? `<table style="width:100%;border-collapse:collapse;font-size:13px;"><tr style="background:#f8fafc;"><th style="padding:8px 12px;text-align:left;font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:1px;">Channel</th><th style="padding:8px 12px;text-align:left;font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:1px;">Messages</th></tr>${channelRows}</table>` : '<p style="font-size:13px;color:#94a3b8;">No messages in the last 24 hours.</p>'}
+      </div>
+
+      <!-- Open tasks -->
+      <div style="padding:24px 28px 0;">
+        <h2 style="margin:0 0 12px;font-size:14px;font-weight:800;color:#1e293b;text-transform:uppercase;letter-spacing:1px;">📋 Open Tasks (${openTasks.length})</h2>
+        ${taskRows ? `<table style="width:100%;border-collapse:collapse;font-size:13px;"><tr style="background:#f8fafc;"><th style="padding:8px 12px;text-align:left;font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:1px;">Task</th><th style="padding:8px 12px;text-align:left;font-size:11px;font-weight:700;color:#64748b;">Assignee</th><th style="padding:8px 12px;text-align:left;font-size:11px;font-weight:700;color:#64748b;">Status</th></tr>${taskRows}</table>` : '<p style="font-size:13px;color:#94a3b8;">No open tasks right now 🎉</p>'}
+      </div>
+
+      <!-- Meetings -->
+      <div style="padding:24px 28px;">
+        <h2 style="margin:0 0 12px;font-size:14px;font-weight:800;color:#1e293b;text-transform:uppercase;letter-spacing:1px;">📅 Meetings Scheduled</h2>
+        ${meetingRows ? `<table style="width:100%;border-collapse:collapse;font-size:13px;"><tr style="background:#f8fafc;"><th style="padding:8px 12px;text-align:left;font-size:11px;font-weight:700;color:#64748b;">Title</th><th style="padding:8px 12px;text-align:left;font-size:11px;font-weight:700;color:#64748b;">Time</th><th style="padding:8px 12px;text-align:left;font-size:11px;font-weight:700;color:#64748b;">Link</th></tr>${meetingRows}</table>` : '<p style="font-size:13px;color:#94a3b8;">No meetings scheduled recently.</p>'}
+      </div>
+
+      <!-- Footer -->
+      <div style="background:#f8fafc;padding:16px 28px;border-top:1px solid #f1f5f9;text-align:center;font-size:11px;color:#94a3b8;letter-spacing:1px;text-transform:uppercase;">&copy; 2026 EduTechExOS &middot; Internal Team OS</div>
+    </div>
+  </div>`;
+}
+
+async function sendDigestEmails(since) {
+  const html = await buildDigestHtml(since);
+  const to = VALID_ACCOUNTS.map((a) => ({ email: a.email, name: a.name }));
+  const subject = `EduTechExOS: Daily Team Digest — ${new Date().toLocaleDateString('en-IN', { day: 'numeric', month: 'short' })}`;
+  const { ok } = await sendBrevoEmail({ to, subject, html });
+  const recipients = to.map((r) => r.email).join(', ');
+  console.log(`[digest] Brevo send ${ok ? 'OK' : 'FAILED'} → ${recipients}`);
+  return { recipients };
+}
+
+// POST /api/digest — manual trigger (admin / testing)
+app.post('/api/digest', async (req, res) => {
+  try {
+    const since = req.body.since ? new Date(req.body.since) : undefined;
+    const result = await sendDigestEmails(since);
+    res.json({ success: true, ...result });
+  } catch (err) {
+    console.error('[digest]', err);
+    res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
+// ── Cron: send digest daily at 09:00 IST = 03:30 UTC ─────────────────────────
+// Uses a simple setInterval (≈ 24 h) so we don't need an extra npm package.
+// For precise scheduling install node-cron and replace this block.
+(function scheduleDailyDigest() {
+  function msUntilNext0330UTC() {
+    const now  = new Date();
+    const next = new Date(now);
+    next.setUTCHours(3, 30, 0, 0);
+    if (next <= now) next.setUTCDate(next.getUTCDate() + 1);
+    return next.getTime() - now.getTime();
+  }
+
+  function arm() {
+    const delay = msUntilNext0330UTC();
+    console.log(`[digest-cron] Next digest in ${Math.round(delay / 60000)} min`);
+    setTimeout(async () => {
+      try {
+        const result = await sendDigestEmails();
+        console.log(`[digest-cron] Digest sent → ${result.recipients}`);
+        if (result.testUrl) console.log(`[digest-cron] Preview: ${result.testUrl}`);
+      } catch (err) {
+        console.error('[digest-cron] Failed:', err);
+      }
+      arm(); // schedule the next day
+    }, delay);
+  }
+
+  arm();
+})();
+
 // ─── Message Routes ────────────────────────────────────────────────────────────
 
-// GET Messages (grouped by channel)
+// GET Messages (grouped by channel — shared, not filtered per-user)
 app.get('/api/messages', async (req, res) => {
   try {
-    const messages = await Message.find({}).lean();
+    const requestingUser = getUserEmail(req);
+    const messages = await Message.find({}).sort({ timestamp: 1 }).lean();
     const grouped = {};
     for (const msg of messages) {
       const channelId = msg.channelId;
       if (!grouped[channelId]) grouped[channelId] = [];
       const { _id, __v, ...rest } = msg;
+
+      // Skip messages hidden for this specific user
+      if (requestingUser && (rest.deletedForUsers || []).includes(requestingUser)) continue;
+
+      // Soft-deleted for everyone — return placeholder (WhatsApp style)
+      if (rest.deletedForEveryone) {
+        grouped[channelId].push({
+          id: _id.toString(),
+          channelId,
+          sender: rest.sender,
+          initials: rest.initials,
+          color: rest.color,
+          timestamp: rest.timestamp instanceof Date ? rest.timestamp.toISOString() : rest.timestamp,
+          parentId: rest.parentId,
+          isDeleted: true,
+          text: '',
+        });
+        continue;
+      }
+
       grouped[channelId].push({
         ...rest,
         id: _id.toString(),
-        // always return date fields as ISO strings
         timestamp: rest.timestamp instanceof Date ? rest.timestamp.toISOString() : rest.timestamp,
         ...(rest.editedAt ? { editedAt: rest.editedAt instanceof Date ? rest.editedAt.toISOString() : rest.editedAt } : {}),
       });
@@ -509,6 +707,11 @@ app.get('/api/messages', async (req, res) => {
 app.post('/api/messages', async (req, res) => {
   try {
     const { id, ...messageData } = req.body;
+    const userEmail = getUserEmail(req);
+    // Attach senderEmail from auth if not already provided
+    if (userEmail && !messageData.senderEmail) {
+      messageData.senderEmail = userEmail;
+    }
     const newMessage = new Message({
       ...messageData,
       clientId: id,
@@ -531,12 +734,36 @@ app.post('/api/messages', async (req, res) => {
   }
 });
 
-// DELETE Message
+// DELETE Message — soft-delete by default; ?hard=true for admin permanent delete
 app.delete('/api/messages/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    await Message.findByIdAndDelete(id);
-    res.json({ success: true });
+    const { scope, userEmail, hard } = req.query;
+
+    if (hard === 'true') {
+      const msg = await Message.findByIdAndDelete(id).lean();
+      if (msg) io.to(msg.channelId).emit('message_deleted', { channelId: msg.channelId, messageId: id });
+      return res.json({ success: true, deleted: 'permanent' });
+    }
+
+    if (scope === 'me' && userEmail) {
+      await Message.findByIdAndUpdate(id, { $addToSet: { deletedForUsers: userEmail } });
+      return res.json({ success: true, deleted: 'for-me' });
+    }
+
+    // Default: soft-delete for everyone
+    const updated = await Message.findByIdAndUpdate(
+      id,
+      { deletedAt: new Date(), deletedForEveryone: true, deletedBy: userEmail || 'unknown' },
+      { new: true }
+    ).lean();
+
+    if (updated) {
+      // Broadcast so other clients immediately show the "deleted" placeholder
+      io.to(updated.channelId).emit('message_deleted', { channelId: updated.channelId, messageId: id });
+    }
+
+    res.json({ success: true, deleted: 'for-everyone' });
   } catch (err) {
     res.status(500).json({ success: false, error: String(err) });
   }
@@ -575,10 +802,14 @@ app.patch('/api/messages/:id', async (req, res) => {
   }
 });
 
-// GET Kanban Tasks
+// GET Kanban Tasks (filtered by user)
 app.get('/api/kanban', async (req, res) => {
   try {
-    const tasks = await KanbanTask.find({}).sort({ createdAt: 1 }).lean();
+    const requestingUser = getUserEmail(req);
+    const filter = requestingUser
+      ? { $or: [{ assigneeEmail: requestingUser }, { assigneeEmail: { $exists: false } }, { assigneeEmail: null }] }
+      : {};
+    const tasks = await KanbanTask.find(filter).sort({ createdAt: 1 }).lean();
     const formatted = tasks.map(({ _id, __v, ...rest }) => ({
       ...rest,
       id: _id.toString(),
@@ -593,7 +824,12 @@ app.get('/api/kanban', async (req, res) => {
 // POST Kanban Task
 app.post('/api/kanban', async (req, res) => {
   try {
-    const task = new KanbanTask(req.body);
+    const userEmail = getUserEmail(req);
+    const body = { ...req.body };
+    if (userEmail && !body.assigneeEmail) {
+      body.assigneeEmail = userEmail;
+    }
+    const task = new KanbanTask(body);
     const saved = await task.save();
     const { _id, __v, ...rest } = saved.toObject();
     res.json({
@@ -644,10 +880,14 @@ app.delete('/api/kanban/:id', async (req, res) => {
   }
 });
 
-// GET Wiki Pages
+// GET Wiki Pages (filtered by user)
 app.get('/api/wikipages', async (req, res) => {
   try {
-    const pages = await WikiPage.find({}).sort({ updatedAt: -1 }).lean();
+    const requestingUser = getUserEmail(req);
+    const filter = requestingUser
+      ? { $or: [{ createdBy: requestingUser }, { createdBy: { $exists: false } }, { createdBy: null }] }
+      : {};
+    const pages = await WikiPage.find(filter).sort({ updatedAt: -1 }).lean();
     const formatted = pages.map((p) => {
       return {
         id: p._id,
@@ -668,14 +908,20 @@ app.get('/api/wikipages', async (req, res) => {
 app.post('/api/wikipages', async (req, res) => {
   try {
     const { id, channelId, title, content } = req.body;
+    const userEmail = getUserEmail(req);
+    const updateFields = { 
+      channelId, 
+      title, 
+      content,
+      updatedAt: new Date()
+    };
+    // Only set createdBy on insert (not on update)
+    if (userEmail) {
+      updateFields.createdBy = userEmail;
+    }
     const updated = await WikiPage.findOneAndUpdate(
       { _id: id },
-      { 
-        channelId, 
-        title, 
-        content,
-        updatedAt: new Date()
-      },
+      updateFields,
       { upsert: true, new: true, setDefaultsOnInsert: true }
     ).lean();
     
@@ -705,10 +951,69 @@ app.delete('/api/wikipages/:id', async (req, res) => {
   }
 });
 
+// ─── Bookmarks ────────────────────────────────────────────────────────────────
+
+// GET Bookmarks for the authenticated user
+app.get('/api/bookmarks', async (req, res) => {
+  try {
+    const userEmail = getUserEmail(req);
+    if (!userEmail) {
+      return res.status(400).json({ success: false, error: 'userEmail required' });
+    }
+    const bookmarks = await Bookmark.find({ userEmail }).sort({ timestamp: -1 }).lean();
+    const formatted = bookmarks.map(({ _id, __v, ...rest }) => ({
+      ...rest,
+      id: _id.toString(),
+      timestamp: rest.timestamp instanceof Date ? rest.timestamp.toISOString() : rest.timestamp,
+    }));
+    res.json({ success: true, bookmarks: formatted });
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
+// POST Bookmark (toggle — if exists, remove; otherwise add)
+app.post('/api/bookmarks/toggle', async (req, res) => {
+  try {
+    const userEmail = getUserEmail(req);
+    const { messageId, channelId, text, sender, timestamp } = req.body;
+    if (!userEmail || !messageId) {
+      return res.status(400).json({ success: false, error: 'userEmail and messageId required' });
+    }
+    const existing = await Bookmark.findOne({ userEmail, messageId }).lean();
+    if (existing) {
+      await Bookmark.deleteOne({ userEmail, messageId });
+      return res.json({ success: true, bookmarked: false });
+    }
+    const bookmark = new Bookmark({ userEmail, messageId, channelId, text, sender, timestamp });
+    await bookmark.save();
+    res.json({ success: true, bookmarked: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
+// DELETE Bookmark
+app.delete('/api/bookmarks/:id', async (req, res) => {
+  try {
+    const userEmail = getUserEmail(req);
+    const { id } = req.params;
+    const bookmark = await Bookmark.findOneAndDelete({ _id: id, userEmail });
+    if (!bookmark) {
+      return res.status(404).json({ success: false, error: 'Bookmark not found' });
+    }
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
+// ─── Notifications ────────────────────────────────────────────────────────────
+
 // GET Notifications (for a specific recipient email)
 app.get('/api/notifications', async (req, res) => {
   try {
-    const { email } = req.query;
+    const email = getUserEmail(req) || req.query.email;
     const query = email
       ? { $or: [{ recipientEmails: { $size: 0 } }, { recipientEmails: email.toLowerCase() }] }
       : {};
@@ -743,6 +1048,24 @@ app.post('/api/notifications', async (req, res) => {
         timestamp: rest.timestamp instanceof Date ? rest.timestamp.toISOString() : rest.timestamp,
       },
     });
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
+// ─── Generic email relay endpoint ─────────────────────────────────────────────
+// Called by Vercel server actions so ALL emails go through Render's stable IP.
+// POST /api/email  { to, subject, htmlContent }
+app.post('/api/email', async (req, res) => {
+  try {
+    const { to, subject, htmlContent } = req.body;
+    if (!to || !subject || !htmlContent) {
+      return res.status(400).json({ success: false, error: 'to, subject, htmlContent are required' });
+    }
+    const recipients = Array.isArray(to) ? to : [{ email: String(to) }];
+    const { ok } = await sendBrevoEmail({ to: recipients, subject, html: htmlContent });
+    if (!ok) return res.status(502).json({ success: false, error: 'Brevo send failed' });
+    res.json({ success: true });
   } catch (err) {
     res.status(500).json({ success: false, error: String(err) });
   }
