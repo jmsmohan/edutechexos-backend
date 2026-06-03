@@ -205,6 +205,19 @@ const BookmarkSchema = new mongoose.Schema({
 BookmarkSchema.index({ userEmail: 1, messageId: 1 }, { unique: true });
 const Bookmark = mongoose.model('Bookmark', BookmarkSchema);
 
+// ── Webhook token schema ─────────────────────────────────────────────────────
+const WebhookTokenSchema = new mongoose.Schema({
+  token:     { type: String, required: true, unique: true, index: true },
+  channelId: { type: String, required: true },
+  name:      { type: String, required: true },
+  type:      { type: String, enum: ['github', 'generic'], default: 'generic' },
+  secret:    { type: String, default: '' },
+  active:    { type: Boolean, default: true },
+  lastUsed:  { type: Date },
+  createdAt: { type: Date, default: Date.now },
+});
+const WebhookToken = mongoose.model('WebhookToken', WebhookTokenSchema);
+
 const NotificationSchema = new mongoose.Schema({
   type: { type: String, default: 'mention' },
   actor: { type: String, required: true },
@@ -1061,6 +1074,175 @@ app.post('/api/notifications', async (req, res) => {
     });
   } catch (err) {
     res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
+// ─── Integrations / Webhooks ──────────────────────────────────────────────────
+
+const crypto = require('crypto');
+
+// Helper: post a bot message to a channel and broadcast via Socket.IO
+async function postBotMessage(channelId, text, color = '#4f46e5') {
+  const msg = new Message({
+    channelId,
+    sender: 'EduTechExOS Bot',
+    initials: 'EB',
+    color,
+    text,
+    timestamp: new Date(),
+  });
+  const saved = await msg.save();
+  const { _id, __v, ...rest } = saved.toObject();
+  const payload = { ...rest, id: _id.toString(), timestamp: rest.timestamp.toISOString() };
+  io.to(channelId).emit('new_message', { channelId, message: payload });
+  return payload;
+}
+
+// Format GitHub event into a readable message
+function formatGithubEvent(event, body) {
+  const repo = body.repository?.full_name || 'unknown/repo';
+  const repoUrl = body.repository?.html_url || '#';
+
+  switch (event) {
+    case 'push': {
+      const branch = (body.ref || '').replace('refs/heads/', '');
+      const pusher = body.pusher?.name || 'Someone';
+      const commits = (body.commits || []).slice(0, 3);
+      const commitLines = commits.map(c => `• \`${c.id?.slice(0,7)}\` ${c.message?.split('\n')[0]}`).join('\n');
+      const more = (body.commits?.length || 0) > 3 ? `\n_...and ${body.commits.length - 3} more_` : '';
+      return `🔀 **${pusher}** pushed to \`${branch}\` in [${repo}](${repoUrl})\n${commitLines}${more}`;
+    }
+    case 'pull_request': {
+      const action = body.action;
+      const pr = body.pull_request;
+      const user = pr?.user?.login || 'Someone';
+      const icons = { opened: '🔁', closed: pr?.merged ? '✅' : '❌', reopened: '🔄', review_requested: '👀' };
+      const icon = icons[action] || '🔁';
+      return `${icon} **PR ${action}**: [${pr?.title}](${pr?.html_url})\nby **${user}** → \`${pr?.base?.ref}\` ← \`${pr?.head?.ref}\``;
+    }
+    case 'issues': {
+      const action = body.action;
+      const issue = body.issue;
+      const user = issue?.user?.login || 'Someone';
+      const icons = { opened: '🐛', closed: '✅', reopened: '🔄' };
+      const icon = icons[action] || '🐛';
+      return `${icon} **Issue ${action}**: [${issue?.title}](${issue?.html_url})\nby **${user}** in [${repo}](${repoUrl})`;
+    }
+    case 'issue_comment': {
+      const issue = body.issue;
+      const comment = body.comment;
+      const user = comment?.user?.login || 'Someone';
+      const preview = (comment?.body || '').slice(0, 120);
+      return `💬 **${user}** commented on [#${issue?.number} ${issue?.title}](${comment?.html_url})\n> ${preview}`;
+    }
+    case 'release': {
+      const rel = body.release;
+      const action = body.action;
+      const user = rel?.author?.login || 'Someone';
+      return `🚀 **Release ${action}**: [${rel?.tag_name} — ${rel?.name}](${rel?.html_url})\nby **${user}** in [${repo}](${repoUrl})`;
+    }
+    case 'create': {
+      const type = body.ref_type;
+      const ref = body.ref;
+      const user = body.sender?.login || 'Someone';
+      return `✨ **${user}** created ${type} \`${ref}\` in [${repo}](${repoUrl})`;
+    }
+    case 'star': {
+      const user = body.sender?.login || 'Someone';
+      const count = body.repository?.stargazers_count;
+      return `⭐ **${user}** starred [${repo}](${repoUrl}) — now at **${count} stars**!`;
+    }
+    default:
+      return `⚙️ GitHub event \`${event}\` received from [${repo}](${repoUrl})`;
+  }
+}
+
+// GET /api/webhooks — list all webhook tokens (admin)
+app.get('/api/webhooks', authMiddleware, async (req, res) => {
+  try {
+    const tokens = await WebhookToken.find({}).sort({ createdAt: -1 }).lean();
+    res.json({ success: true, webhooks: tokens.map(({ _id, __v, ...t }) => ({ ...t, id: _id.toString() })) });
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
+// POST /api/webhooks — create a new webhook token
+app.post('/api/webhooks', authMiddleware, async (req, res) => {
+  try {
+    const { channelId, name, type, secret } = req.body;
+    if (!channelId || !name) return res.status(400).json({ success: false, error: 'channelId and name required' });
+    const token = crypto.randomBytes(24).toString('hex');
+    const wh = new WebhookToken({ token, channelId, name, type: type || 'generic', secret: secret || '' });
+    const saved = await wh.save();
+    const { _id, __v, ...rest } = saved.toObject();
+    res.json({ success: true, webhook: { ...rest, id: _id.toString() } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
+// DELETE /api/webhooks/:id — delete a webhook token
+app.delete('/api/webhooks/:id', authMiddleware, async (req, res) => {
+  try {
+    await WebhookToken.findByIdAndDelete(req.params.id);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
+// PATCH /api/webhooks/:id — toggle active
+app.patch('/api/webhooks/:id', authMiddleware, async (req, res) => {
+  try {
+    const updated = await WebhookToken.findByIdAndUpdate(req.params.id, { $set: req.body }, { new: true }).lean();
+    if (!updated) return res.status(404).json({ success: false, error: 'Not found' });
+    const { _id, __v, ...rest } = updated;
+    res.json({ success: true, webhook: { ...rest, id: _id.toString() } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
+// POST /webhook/github/:token — GitHub webhook receiver
+app.post('/webhook/github/:token', express.json({ type: '*/*' }), async (req, res) => {
+  try {
+    const wh = await WebhookToken.findOne({ token: req.params.token, type: 'github', active: true });
+    if (!wh) return res.status(404).json({ error: 'Webhook not found or inactive' });
+
+    // Verify HMAC signature if secret is set
+    if (wh.secret) {
+      const sig = req.headers['x-hub-signature-256'] || '';
+      const expected = 'sha256=' + crypto.createHmac('sha256', wh.secret).update(JSON.stringify(req.body)).digest('hex');
+      if (sig !== expected) return res.status(401).json({ error: 'Invalid signature' });
+    }
+
+    const event = req.headers['x-github-event'] || 'unknown';
+    const text = formatGithubEvent(event, req.body);
+    await postBotMessage(wh.channelId, text, '#24292f');
+    await WebhookToken.findByIdAndUpdate(wh._id, { lastUsed: new Date() });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[github-webhook]', err);
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+// POST /webhook/incoming/:token — generic incoming webhook (Zapier, Make, etc.)
+app.post('/webhook/incoming/:token', express.json({ type: '*/*' }), async (req, res) => {
+  try {
+    const wh = await WebhookToken.findOne({ token: req.params.token, type: 'generic', active: true });
+    if (!wh) return res.status(404).json({ error: 'Webhook not found or inactive' });
+
+    const { text, title, color } = req.body;
+    if (!text) return res.status(400).json({ error: 'text field required' });
+
+    const message = title ? `**${title}**\n${text}` : text;
+    await postBotMessage(wh.channelId, message, color || '#4f46e5');
+    await WebhookToken.findByIdAndUpdate(wh._id, { lastUsed: new Date() });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
   }
 });
 
