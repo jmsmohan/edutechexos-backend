@@ -247,6 +247,17 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', time: new Date().toISOString() });
 });
 
+// Returns this server's outbound IP (used to whitelist in Brevo)
+app.get('/my-ip', async (req, res) => {
+  try {
+    const r = await fetch('https://api.ipify.org?format=json');
+    const data = await r.json();
+    res.json({ ip: data.ip });
+  } catch (err) {
+    res.json({ error: String(err) });
+  }
+});
+
 // Apply auth middleware to all /api/* routes except auth endpoints
 app.use(/^\/api\/(?!auth\/|access-requests|digest|health).*/, authMiddleware);
 
