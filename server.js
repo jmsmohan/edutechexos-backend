@@ -8,6 +8,7 @@ const http = require('http');
 const { Server } = require('socket.io');
 const mongoose = require('mongoose');
 const cors = require('cors');
+const rateLimit = require('express-rate-limit');
 // nodemailer replaced by Brevo HTTP API (no IP-whitelist issues)
 const jwt = require('jsonwebtoken');
 require('dotenv').config({ path: require('path').join(__dirname, '.env') });
@@ -71,6 +72,43 @@ io.on('connection', (socket) => {
     socket.leave(channelId);
   });
 
+  // Typing indicators — broadcast to everyone else in the channel room
+  socket.on('typing_start', ({ channelId, userName }) => {
+    if (!channelId || !userName) return;
+    socket.to(channelId).emit('user_typing', { channelId, userName });
+  });
+
+  socket.on('typing_stop', ({ channelId, userName }) => {
+    if (!channelId || !userName) return;
+    socket.to(channelId).emit('user_stopped_typing', { channelId, userName });
+  });
+
+  // ── Direct Message rooms ──────────────────────────────────────────────
+  // Each DM conversation gets a room named dm:emailA::emailB (sorted)
+  socket.on('join_dm', ({ myEmail, partnerEmail }) => {
+    if (!myEmail || !partnerEmail) return;
+    const room = 'dm:' + [myEmail.toLowerCase(), partnerEmail.toLowerCase()].sort().join('::');
+    socket.join(room);
+  });
+
+  socket.on('leave_dm', ({ myEmail, partnerEmail }) => {
+    if (!myEmail || !partnerEmail) return;
+    const room = 'dm:' + [myEmail.toLowerCase(), partnerEmail.toLowerCase()].sort().join('::');
+    socket.leave(room);
+  });
+
+  socket.on('dm_typing_start', ({ myEmail, partnerEmail }) => {
+    if (!myEmail || !partnerEmail) return;
+    const room = 'dm:' + [myEmail.toLowerCase(), partnerEmail.toLowerCase()].sort().join('::');
+    socket.to(room).emit('dm_user_typing', { fromEmail: myEmail });
+  });
+
+  socket.on('dm_typing_stop', ({ myEmail, partnerEmail }) => {
+    if (!myEmail || !partnerEmail) return;
+    const room = 'dm:' + [myEmail.toLowerCase(), partnerEmail.toLowerCase()].sort().join('::');
+    socket.to(room).emit('dm_user_stopped_typing', { fromEmail: myEmail });
+  });
+
   socket.on('disconnect', () => {
     // rooms are automatically cleaned up on disconnect
   });
@@ -98,6 +136,39 @@ app.options('*', cors(corsOptions));
 app.use(cors(corsOptions));
 app.use(express.json());
 
+// ── Rate Limiting ─────────────────────────────────────────────────────────────
+// Auth endpoints: strict limit to prevent brute-force / credential stuffing
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many auth attempts. Please wait 15 minutes before trying again.' },
+});
+
+// Message/API endpoints: generous limit for normal usage
+const apiLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests. Please slow down.' },
+});
+
+// Global fallback
+const globalLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+app.use('/api/auth/', authLimiter);
+app.use('/api/access-requests', authLimiter);
+app.use('/api/messages', apiLimiter);
+app.use('/api/kanban', apiLimiter);
+app.use('/api/', globalLimiter);
+
 // --- 1. MongoDB Connection ---
 const MONGODB_URI = process.env.MONGODB_URI;
 if (!MONGODB_URI) {
@@ -105,7 +176,24 @@ if (!MONGODB_URI) {
 }
 
 mongoose.connect(MONGODB_URI)
-  .then(() => console.log('Successfully connected to MongoDB Atlas'))
+  .then(() => {
+    console.log('Successfully connected to MongoDB Atlas');
+    // ── Drop any accidental TTL indexes on accessrequests ─────────────
+    // If MongoDB Atlas created a TTL on requestedAt, users vanish after
+    // that window. We remove it at startup so accounts are permanent.
+    mongoose.connection.collection('accessrequests').indexes()
+      .then((idxs) => {
+        idxs.forEach((idx) => {
+          if (idx.expireAfterSeconds !== undefined) {
+            mongoose.connection.collection('accessrequests')
+              .dropIndex(idx.name)
+              .then(() => console.log('[startup] Removed TTL index on accessrequests:', idx.name))
+              .catch((e) => console.warn('[startup] Could not drop TTL index:', e.message));
+          }
+        });
+      })
+      .catch(() => {});
+  })
   .catch((err) => {
     console.error('Failed to connect to MongoDB Atlas (non-fatal):', err);
     // Continue without exiting; DB-dependent routes may fail gracefully
@@ -156,8 +244,25 @@ const AccessRequestSchema = new mongoose.Schema({
   role:        { type: String, required: true },
   status:      { type: String, enum: ['pending', 'approved', 'rejected'], default: 'pending' },
   requestedAt: { type: Date, default: Date.now },
+  channelId:   { type: String },
+  channelIds:  [{ type: String }],
 });
 const AccessRequest = mongoose.model('AccessRequest', AccessRequestSchema);
+
+// ── Direct Messages ──────────────────────────────────────────────────────────
+const DirectMessageSchema = new mongoose.Schema({
+  fromEmail:  { type: String, required: true, index: true },
+  fromName:   { type: String, required: true },
+  toEmail:    { type: String, required: true, index: true },
+  text:       { type: String, default: '' },
+  audioUrl:   { type: String },
+  files:      [{ name: String, url: String, type: String }],
+  timestamp:  { type: Date, default: Date.now },
+  read:       { type: Boolean, default: false },
+}, { strict: false });
+// Compound index so conversation queries are fast
+DirectMessageSchema.index({ fromEmail: 1, toEmail: 1, timestamp: -1 });
+const DirectMessage = mongoose.model('DirectMessage', DirectMessageSchema);
 
 // ── Password reset codes (TTL: 15 min) ──────────────────────────────────────
 const ResetCodeSchema = new mongoose.Schema({
@@ -205,19 +310,6 @@ const BookmarkSchema = new mongoose.Schema({
 BookmarkSchema.index({ userEmail: 1, messageId: 1 }, { unique: true });
 const Bookmark = mongoose.model('Bookmark', BookmarkSchema);
 
-// ── Webhook token schema ─────────────────────────────────────────────────────
-const WebhookTokenSchema = new mongoose.Schema({
-  token:     { type: String, required: true, unique: true, index: true },
-  channelId: { type: String, required: true },
-  name:      { type: String, required: true },
-  type:      { type: String, enum: ['github', 'generic'], default: 'generic' },
-  secret:    { type: String, default: '' },
-  active:    { type: Boolean, default: true },
-  lastUsed:  { type: Date },
-  createdAt: { type: Date, default: Date.now },
-});
-const WebhookToken = mongoose.model('WebhookToken', WebhookTokenSchema);
-
 const NotificationSchema = new mongoose.Schema({
   type: { type: String, default: 'mention' },
   actor: { type: String, required: true },
@@ -229,6 +321,99 @@ const NotificationSchema = new mongoose.Schema({
   recipientEmails: [{ type: String }],
 });
 const Notification = mongoose.model('Notification', NotificationSchema);
+
+// ── Webhook schema ────────────────────────────────────────────────────────────
+const WebhookSchema = new mongoose.Schema({
+  name:      { type: String, required: true },
+  channelId: { type: String, required: true },
+  type:      { type: String, enum: ['github', 'generic'], required: true },
+  token:     { type: String, required: true, unique: true, index: true },
+  secret:    { type: String, default: '' },    // GitHub HMAC secret (optional)
+  active:    { type: Boolean, default: true },
+  lastUsed:  { type: Date },
+  createdAt: { type: Date, default: Date.now },
+});
+const Webhook = mongoose.model('Webhook', WebhookSchema);
+
+// ── LoginEvent schema — tracks real login timestamps per user ─────────────────
+const LoginEventSchema = new mongoose.Schema({
+  email:    { type: String, required: true, index: true },
+  name:     { type: String, default: '' },
+  loginAt:  { type: Date, default: Date.now, index: true },
+  dateStr:  { type: String, required: true, index: true }, // YYYY-MM-DD (IST)
+});
+LoginEventSchema.index({ email: 1, dateStr: 1 });
+const LoginEvent = mongoose.model('LoginEvent', LoginEventSchema);
+
+// ── MediaFile schema — separate storage for audio/video with access control ───
+const MediaFileSchema = new mongoose.Schema({
+  ownerEmail:  { type: String, required: true, index: true },
+  channelId:   { type: String, required: true, index: true },
+  messageId:   { type: String, index: true },
+  kind:        { type: String, enum: ['audio', 'video', 'screen'], required: true },
+  url:         { type: String, required: true },
+  mimeType:    { type: String, default: '' },
+  sizeBytes:   { type: Number, default: 0 },
+  uploadedAt:  { type: Date, default: Date.now },
+});
+const MediaFile = mongoose.model('MediaFile', MediaFileSchema);
+
+// ── UserSettings schema — stores per-user preferences synced across devices ─────
+const UserSettingsSchema = new mongoose.Schema({
+  email:                { type: String, required: true, unique: true, index: true },
+  displayName:          { type: String, default: '' },
+  avatarEmoji:          { type: String, default: '' },
+  status:               { type: String, enum: ['online', 'away', 'busy', 'offline'], default: 'online' },
+  meetLink:             { type: String, default: '' },
+  emailNotifications:   { type: Boolean, default: true },
+  desktopNotifications: { type: Boolean, default: false },
+  soundNotifications:   { type: Boolean, default: true },
+  compactChat:          { type: Boolean, default: false },
+  fontSize:             { type: String, enum: ['normal', 'large'], default: 'normal' },
+  enterToSend:          { type: Boolean, default: false },
+  darkMode:             { type: Boolean, default: false },
+}, { timestamps: true });
+const UserSettings = mongoose.model('UserSettings', UserSettingsSchema);
+
+// ── PinnedMessage schema — team-shared pins per channel ───────────────────────
+const PinnedMessageSchema = new mongoose.Schema({
+  channelId: { type: String, required: true, index: true },
+  messageId: { type: String, required: true },
+  pinnedBy:  { type: String, required: true },
+  pinnedAt:  { type: Date, default: Date.now },
+});
+PinnedMessageSchema.index({ channelId: 1, messageId: 1 }, { unique: true });
+const PinnedMessage = mongoose.model('PinnedMessage', PinnedMessageSchema);
+
+// ── WorkspaceChannel schema — replaces hardcoded channel list ─────────────────
+const WorkspaceChannelSchema = new mongoose.Schema({
+  _id:         { type: String, required: true },
+  name:        { type: String, required: true },
+  description: { type: String, default: '' },
+  isDefault:   { type: Boolean, default: false },
+  createdBy:   { type: String, default: '' },
+  order:       { type: Number, default: 0 },
+}, { timestamps: true });
+const WorkspaceChannel = mongoose.model('WorkspaceChannel', WorkspaceChannelSchema);
+
+const DEFAULT_WORKSPACE_CHANNELS = [
+  { _id: 'general',          name: 'general',          description: 'Team-wide announcements and updates',              isDefault: true, order: 0 },
+  { _id: 'skillnaav',        name: 'skillnaav',        description: 'Career navigation & skill gap analysis product',   isDefault: true, order: 1 },
+  { _id: 'edutechexassessa', name: 'edutechexassessa', description: 'Assessment platform & adaptive question engine',   isDefault: true, order: 2 },
+  { _id: 'edutechex',        name: 'edutechex',        description: 'Core platform — Cambridge, IB, teacher training', isDefault: true, order: 3 },
+];
+
+// ── MeetingAccess schema — tracks who has access to a specific scheduled meeting
+const MeetingAccessSchema = new mongoose.Schema({
+  messageId:       { type: String, required: true, index: true },
+  channelId:       { type: String, required: true },
+  hostEmail:       { type: String, required: true },
+  allowedEmails:   [{ type: String }],  // from "Mentioned people" + host
+  grantedEmails:   [{ type: String }],  // extra grants by host at runtime
+  createdAt:       { type: Date, default: Date.now },
+});
+MeetingAccessSchema.index({ messageId: 1, channelId: 1 }, { unique: true });
+const MeetingAccess = mongoose.model('MeetingAccess', MeetingAccessSchema);
 
 // ── Auth middleware ──────────────────────────────────────────────────────────
 function authMiddleware(req, res, next) {
@@ -258,17 +443,6 @@ function getUserEmail(req) {
 // Health Check
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', time: new Date().toISOString() });
-});
-
-// Returns this server's outbound IP (used to whitelist in Brevo)
-app.get('/my-ip', async (req, res) => {
-  try {
-    const r = await fetch('https://api.ipify.org?format=json');
-    const data = await r.json();
-    res.json({ ip: data.ip });
-  } catch (err) {
-    res.json({ error: String(err) });
-  }
 });
 
 // Apply auth middleware to all /api/* routes except auth endpoints
@@ -333,18 +507,38 @@ app.get('/api/access-requests', async (req, res) => {
   }
 });
 
-// PATCH /api/access-requests/:id — admin approves or rejects
+// PATCH /api/access-requests/:id — admin approves, rejects or updates user role/channel
 app.patch('/api/access-requests/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const { status } = req.body; // 'approved' | 'rejected'
+    const { status, channelId, channelIds, role } = req.body;
+
+    const updateFields = {};
+    if (status !== undefined) updateFields.status = status;
+    if (channelId !== undefined) updateFields.channelId = channelId;
+    if (channelIds !== undefined) updateFields.channelIds = Array.isArray(channelIds) ? channelIds : [];
+    if (role !== undefined) updateFields.role = role;
+
     const updated = await AccessRequest.findByIdAndUpdate(
       id,
-      { $set: { status } },
+      { $set: updateFields },
       { new: true }
     ).lean();
     if (!updated) return res.status(404).json({ success: false, error: 'Request not found' });
     const { _id, __v, ...rest } = updated;
+
+    // Broadcast member change so all connected clients refresh their member list
+    if (status === 'approved' || role !== undefined || channelId !== undefined || channelIds !== undefined) {
+      io.emit('member_updated', {
+        memberId: `member-${_id.toString()}`,
+        email: rest.email,
+        role: rest.role,
+        channelId: rest.channelId,
+        channelIds: rest.channelIds || [],
+        status: rest.status,
+      });
+    }
+
     res.json({
       success: true,
       request: {
@@ -369,6 +563,505 @@ app.delete('/api/access-requests/:id', async (req, res) => {
   }
 });
 
+// GET /api/members — returns all members (hardcoded + approved requests)
+app.get('/api/members', async (req, res) => {
+  try {
+    if (!req.user) {
+      return res.status(401).json({ success: false, error: 'Unauthorized. Please log in first.' });
+    }
+
+    const hardcoded = [
+      { id: 'member-ac', name: 'Aditya Cherikuri', email: 'aditya@edutechex.in', role: 'Manager', initials: 'AC', status: 'online', color: '#2563eb' },
+      { id: 'member-rk', name: 'Ram K Aluru', email: 'dev.rk@edutechex.in', role: 'Developer', initials: 'RK', status: 'online', color: '#7c3aed' },
+      { id: 'member-sa', name: 'Sneha Agarwal', email: 'design.sa@edutechex.in', role: 'Designer', initials: 'SA', status: 'away', color: '#0891b2' },
+      { id: 'member-tm', name: 'Tarun Mehta', email: 'tarun@edutechex.in', role: 'Lead', initials: 'TM', status: 'offline', color: '#059669' },
+      { id: 'member-mk', name: 'Mohan Kumar', email: 'mohan.kumar@edutechex.in', role: 'Developer', initials: 'MK', status: 'online', color: '#dc2626' },
+      { id: 'member-mr', name: 'Mohan Reddy', email: 'mohan.reddy@edutechex.in', role: 'Developer', initials: 'MR', status: 'online', color: '#eab308' },
+      { id: 'member-ms', name: 'Mohan Sen', email: 'mohan.sen@edutechex.in', role: 'Developer', initials: 'MS', status: 'online', color: '#0891b2' },
+    ];
+
+    const approvedRequests = await AccessRequest.find({ status: 'approved' }).lean();
+
+    const colors = ['#2d6a4f', '#52b788', '#7c3aed', '#a78bfa', '#1b4332', '#c4b5fd'];
+    const getDeterministicColor = (email) => {
+      let hash = 0;
+      for (let i = 0; i < email.length; i++) {
+        hash = email.charCodeAt(i) + ((hash << 5) - hash);
+      }
+      const index = Math.abs(hash) % colors.length;
+      return colors[index];
+    };
+
+    const dbMembers = approvedRequests.map((r) => {
+      const initials = r.name
+        .split(' ')
+        .map((p) => p[0])
+        .join('')
+        .toUpperCase()
+        .slice(0, 2);
+      // Normalise: channelIds is authoritative; fall back to legacy channelId
+      const ids = r.channelIds && r.channelIds.length > 0
+        ? r.channelIds
+        : (r.channelId ? [r.channelId] : []);
+      return {
+        id: `member-${r._id.toString()}`,
+        name: r.name,
+        email: r.email,
+        role: r.role,
+        status: 'online',
+        color: getDeterministicColor(r.email),
+        initials,
+        channelId: r.channelId,
+        channelIds: ids,
+      };
+    });
+
+    const allMembers = [...hardcoded];
+    dbMembers.forEach((dbm) => {
+      if (!allMembers.some((m) => m.email.toLowerCase() === dbm.email.toLowerCase())) {
+        allMembers.push(dbm);
+      }
+    });
+
+    res.json({ success: true, members: allMembers });
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
+// POST /api/members — admin directly creates a new approved user
+app.post('/api/members', async (req, res) => {
+  try {
+    if (!req.user || req.user.role !== 'Admin') {
+      return res.status(403).json({ success: false, error: 'Only admins can add members directly.' });
+    }
+
+    const { name, email, role, channelId } = req.body;
+    const emailClean = String(email).trim().toLowerCase();
+
+    const VALID_EMAILS = [
+      'admin@edutechex.in', 'aditya@edutechex.in', 'dev.rk@edutechex.in',
+      'design.sa@edutechex.in', 'tarun@edutechex.in', 'mohan.kumar@edutechex.in',
+      'mohan.reddy@edutechex.in', 'mohan.sen@edutechex.in'
+    ];
+    if (VALID_EMAILS.includes(emailClean)) {
+      return res.status(409).json({ success: false, error: 'This email belongs to a system account.' });
+    }
+
+    const existing = await AccessRequest.findOne({ email: emailClean }).lean();
+    if (existing) {
+      return res.status(409).json({ success: false, error: 'A user request/account with this email already exists.' });
+    }
+
+    const request = new AccessRequest({
+      name,
+      email: emailClean,
+      password: 'Welcome@2026', // default password
+      role,
+      status: 'approved',
+      channelId,
+    });
+
+    const saved = await request.save();
+    const { _id, __v, ...rest } = saved.toObject();
+
+    res.json({
+      success: true,
+      member: {
+        id: `member-${_id.toString()}`,
+        name: rest.name,
+        email: rest.email,
+        role: rest.role,
+        status: 'online',
+        color: '#4f46e5',
+        initials: rest.name.split(' ').map((p) => p[0]).join('').toUpperCase().slice(0, 2),
+        channelId: rest.channelId,
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
+
+// GET /api/login-status — returns who logged in today (for calendar green/red dots)
+app.get('/api/login-status', authMiddleware, async (req, res) => {
+  try {
+    const dateStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+    const events = await LoginEvent.find({ dateStr }).lean();
+    const loggedInEmails = events.map((e) => e.email);
+    res.json({ success: true, dateStr, loggedInEmails });
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
+// GET /api/login-history — returns 30-day login history per user (for calendar heatmap)
+app.get('/api/login-history', authMiddleware, async (req, res) => {
+  try {
+    const thirtyDaysAgo = new Date();
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+    const events = await LoginEvent.find({ loginAt: { $gte: thirtyDaysAgo } }).lean();
+    const history = {};
+    events.forEach((e) => {
+      if (!history[e.email]) history[e.email] = [];
+      if (!history[e.email].includes(e.dateStr)) history[e.email].push(e.dateStr);
+    });
+    res.json({ success: true, history });
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
+// POST /api/members/:id/promote-admin — admin promotes a user to admin (max 3 admins)
+app.post('/api/members/:id/promote-admin', authMiddleware, async (req, res) => {
+  try {
+    if (!req.user || req.user.role !== 'Admin') {
+      return res.status(403).json({ success: false, error: 'Only admins can promote users.' });
+    }
+
+    // Count current admins (hardcoded + DB)
+    const HARDCODED_ADMINS = VALID_ACCOUNTS.filter((a) => a.role === 'Admin').length;
+    const dbAdmins = await AccessRequest.countDocuments({ status: 'approved', role: 'Admin' });
+    const totalAdmins = HARDCODED_ADMINS + dbAdmins;
+
+    if (totalAdmins >= 3) {
+      return res.status(400).json({
+        success: false,
+        error: 'Maximum 3 admins allowed. Remove an existing admin first.',
+      });
+    }
+
+    const { id } = req.params;
+    const updated = await AccessRequest.findByIdAndUpdate(
+      id,
+      { $set: { role: 'Admin' } },
+      { new: true }
+    ).lean();
+    if (!updated) return res.status(404).json({ success: false, error: 'User not found.' });
+
+    io.emit('member_updated', {
+      memberId: `member-${id}`,
+      email: updated.email,
+      role: 'Admin',
+      channelId: updated.channelId,
+    });
+
+    res.json({ success: true, message: `${updated.name} is now an Admin.` });
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
+// POST /api/meeting-access — create/get meeting access record
+app.post('/api/meeting-access', authMiddleware, async (req, res) => {
+  try {
+    const { messageId, channelId, hostEmail, allowedEmails } = req.body;
+    if (!messageId || !channelId || !hostEmail) {
+      return res.status(400).json({ success: false, error: 'messageId, channelId, and hostEmail are required.' });
+    }
+    const doc = await MeetingAccess.findOneAndUpdate(
+      { messageId, channelId },
+      { $setOnInsert: { hostEmail, allowedEmails: allowedEmails || [], grantedEmails: [] } },
+      { upsert: true, new: true }
+    ).lean();
+    res.json({ success: true, access: doc });
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
+// GET /api/meeting-access/:messageId — check if current user can join meeting
+app.get('/api/meeting-access/:messageId', authMiddleware, async (req, res) => {
+  try {
+    const doc = await MeetingAccess.findOne({ messageId: req.params.messageId }).lean();
+    if (!doc) return res.json({ success: true, canJoin: true, exists: false });
+
+    const userEmail = req.user?.email?.toLowerCase() || '';
+    const allowed = doc.allowedEmails.map((e) => e.toLowerCase());
+    const granted = doc.grantedEmails.map((e) => e.toLowerCase());
+    const canJoin = userEmail === doc.hostEmail.toLowerCase()
+      || allowed.includes(userEmail)
+      || granted.includes(userEmail);
+
+    res.json({ success: true, canJoin, hostEmail: doc.hostEmail, exists: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
+// PATCH /api/meeting-access/:messageId/grant — host grants access to an email
+app.patch('/api/meeting-access/:messageId/grant', authMiddleware, async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ success: false, error: 'email is required.' });
+
+    const doc = await MeetingAccess.findOne({ messageId: req.params.messageId }).lean();
+    if (!doc) return res.status(404).json({ success: false, error: 'Meeting access record not found.' });
+
+    if (req.user?.email?.toLowerCase() !== doc.hostEmail.toLowerCase() && req.user?.role !== 'Admin') {
+      return res.status(403).json({ success: false, error: 'Only the meeting host or admin can grant access.' });
+    }
+
+    await MeetingAccess.findByIdAndUpdate(doc._id, { $addToSet: { grantedEmails: email.toLowerCase() } });
+
+    // Notify the specific user that they've been granted access
+    io.emit('meeting_access_granted', { messageId: req.params.messageId, email: email.toLowerCase() });
+
+    res.json({ success: true, message: `Access granted to ${email}.` });
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
+// ── Direct Message Routes ──────────────────────────────────────────────────────
+
+// GET /api/dm/conversations — list all unique DM partners for the current user
+app.get('/api/dm/conversations', authMiddleware, async (req, res) => {
+  try {
+    const myEmail = req.user.email.toLowerCase();
+
+    // Pull latest message per conversation partner
+    const msgs = await DirectMessage.find({
+      $or: [{ fromEmail: myEmail }, { toEmail: myEmail }],
+    }).sort({ timestamp: -1 }).lean();
+
+    const convMap = new Map();
+    for (const msg of msgs) {
+      const partner = msg.fromEmail === myEmail ? msg.toEmail : msg.fromEmail;
+      const partnerName = msg.fromEmail === myEmail ? null : msg.fromName;
+      if (!convMap.has(partner)) {
+        convMap.set(partner, {
+          partnerEmail: partner,
+          partnerName: partnerName || partner,
+          lastMessage: msg.text || (msg.audioUrl ? '[Voice message]' : '[File]'),
+          lastTimestamp: msg.timestamp,
+          unread: 0,
+        });
+      }
+      if (msg.toEmail === myEmail && !msg.read) {
+        convMap.get(partner).unread = (convMap.get(partner).unread || 0) + 1;
+      }
+    }
+
+    // Enrich partner names from AccessRequest if missing
+    const convList = Array.from(convMap.values());
+    for (const conv of convList) {
+      if (!conv.partnerName || conv.partnerName === conv.partnerEmail) {
+        const u = await AccessRequest.findOne({ email: conv.partnerEmail }).lean().catch(() => null);
+        if (u) conv.partnerName = u.name;
+      }
+    }
+
+    res.json({ success: true, conversations: convList });
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
+// GET /api/dm/:partnerEmail — fetch message thread with one user
+app.get('/api/dm/:partnerEmail', authMiddleware, async (req, res) => {
+  try {
+    const myEmail = req.user.email.toLowerCase();
+    const partnerEmail = decodeURIComponent(req.params.partnerEmail).toLowerCase();
+    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+
+    const msgs = await DirectMessage.find({
+      $or: [
+        { fromEmail: myEmail,      toEmail: partnerEmail },
+        { fromEmail: partnerEmail, toEmail: myEmail      },
+      ],
+    }).sort({ timestamp: 1 }).limit(limit).lean();
+
+    // Mark incoming messages as read
+    await DirectMessage.updateMany(
+      { fromEmail: partnerEmail, toEmail: myEmail, read: false },
+      { $set: { read: true } }
+    ).catch(() => {});
+
+    const formatted = msgs.map(({ _id, __v, ...m }) => ({ id: _id.toString(), ...m }));
+    res.json({ success: true, messages: formatted });
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
+// POST /api/dm/:partnerEmail — send a direct message
+app.post('/api/dm/:partnerEmail', authMiddleware, async (req, res) => {
+  try {
+    const myEmail    = req.user.email.toLowerCase();
+    const myName     = req.user.name || req.user.email;
+    const partnerEmail = decodeURIComponent(req.params.partnerEmail).toLowerCase();
+    const { text, audioUrl, files } = req.body;
+
+    if (!text && !audioUrl && (!files || files.length === 0)) {
+      return res.status(400).json({ success: false, error: 'Message content is required.' });
+    }
+
+    const saved = await new DirectMessage({
+      fromEmail:  myEmail,
+      fromName:   myName,
+      toEmail:    partnerEmail,
+      text:       text || '',
+      audioUrl:   audioUrl || undefined,
+      files:      files   || [],
+      timestamp:  new Date(),
+      read:       false,
+    }).save();
+
+    const formatted = { id: saved._id.toString(), ...saved.toObject() };
+    delete formatted._id; delete formatted.__v;
+
+    // Push real-time to both sides of the conversation
+    const room = 'dm:' + [myEmail, partnerEmail].sort().join('::');
+    io.to(room).emit('dm_message', formatted);
+
+    res.json({ success: true, message: formatted });
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
+// DELETE /api/dm/:id — soft-delete a single DM (only sender can delete)
+app.delete('/api/dm/:id', authMiddleware, async (req, res) => {
+  try {
+    const msg = await DirectMessage.findById(req.params.id).lean();
+    if (!msg) return res.status(404).json({ success: false, error: 'Message not found.' });
+    if (msg.fromEmail !== req.user.email.toLowerCase() && req.user.role !== 'Admin') {
+      return res.status(403).json({ success: false, error: 'Only the sender can delete this message.' });
+    }
+    await DirectMessage.findByIdAndUpdate(req.params.id, { $set: { text: 'Message deleted.', deleted: true } });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
+// GET /api/dm/unread-count — total unread DMs for current user
+app.get('/api/dm/unread-count', authMiddleware, async (req, res) => {
+  try {
+    const count = await DirectMessage.countDocuments({
+      toEmail: req.user.email.toLowerCase(),
+      read: false,
+    });
+    res.json({ success: true, count });
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
+// ── Meeting Invite Email ───────────────────────────────────────────────────────
+
+// POST /api/meetings/invite — send a meeting invite email to all team members
+app.post('/api/meetings/invite', authMiddleware, async (req, res) => {
+  try {
+    const { title, time, joinLink, channelId } = req.body;
+    if (!title || !joinLink) {
+      return res.status(400).json({ success: false, error: 'title and joinLink are required.' });
+    }
+
+    // Collect ALL team members (hardcoded + approved DB users)
+    const toMap = new Map(VALID_ACCOUNTS.map(a => [a.email, { email: a.email, name: a.name }]));
+    try {
+      const dbUsers = await AccessRequest.find({ status: 'approved' }).lean();
+      for (const u of dbUsers) {
+        if (!toMap.has(u.email)) toMap.set(u.email, { email: u.email, name: u.name });
+      }
+    } catch (_) { /* non-fatal */ }
+
+    const to = Array.from(toMap.values());
+    const hostName = req.user?.name || req.user?.email || 'A team member';
+
+    const html = `
+      <div style="font-family:Inter,Arial,sans-serif;background:#f8fafc;padding:32px;">
+        <div style="max-width:520px;margin:0 auto;background:#fff;border:1px solid #e2e8f0;border-radius:16px;overflow:hidden;">
+          <div style="background:linear-gradient(135deg,#0A1128,#1E2E5C);padding:24px 28px;">
+            <p style="margin:0;color:rgba(212,175,55,0.7);font-size:10px;font-weight:700;letter-spacing:3px;text-transform:uppercase;">EduTechExOS · Meeting Invite</p>
+            <h1 style="margin:8px 0 0;font-size:22px;color:#fff;">${title}</h1>
+          </div>
+          <div style="padding:28px;">
+            <p style="margin:0 0 20px;color:#334155;font-size:14px;line-height:1.7;">
+              <strong>${hostName}</strong> has scheduled a meeting and invited your team.
+            </p>
+            ${time ? `
+            <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;padding:14px 16px;background:#f8fafc;border-radius:10px;border:1px solid #e2e8f0;">
+              <span style="font-size:20px;">📅</span>
+              <div>
+                <p style="margin:0;font-size:10px;font-weight:700;color:#94a3b8;letter-spacing:1px;text-transform:uppercase;">Scheduled Time</p>
+                <p style="margin:4px 0 0;font-size:14px;font-weight:600;color:#1e293b;">${time}</p>
+              </div>
+            </div>` : ''}
+            <div style="margin-bottom:28px;padding:14px 16px;background:#f8fafc;border-radius:10px;border:1px solid #e2e8f0;">
+              <p style="margin:0;font-size:10px;font-weight:700;color:#94a3b8;letter-spacing:1px;text-transform:uppercase;">Channel</p>
+              <p style="margin:4px 0 0;font-size:14px;font-weight:600;color:#1e293b;">#${channelId || 'general'}</p>
+            </div>
+            <a href="${joinLink}" style="display:inline-block;padding:14px 32px;background:#D4AF37;color:#0A1128;font-weight:800;font-size:13px;text-decoration:none;border-radius:8px;">
+              Join Meeting →
+            </a>
+            <p style="margin:20px 0 0;font-size:12px;color:#94a3b8;word-break:break-all;">
+              Or copy this link:<br/>
+              <a href="${joinLink}" style="color:#3E4A89;">${joinLink}</a>
+            </p>
+          </div>
+          <div style="background:#f8fafc;padding:14px 28px;border-top:1px solid #f1f5f9;text-align:center;font-size:11px;color:#94a3b8;letter-spacing:1px;text-transform:uppercase;">
+            &copy; 2026 EduTechExOS &middot; Institutional Team OS
+          </div>
+        </div>
+      </div>`;
+
+    const subject = `Meeting Invite: ${title}${time ? ' · ' + time : ''}`;
+    const { ok } = await sendBrevoEmail({ to, subject, html });
+    console.log(`[meeting-invite] ${ok ? 'OK' : 'FAILED'} → ${to.length} recipients`);
+    res.json({ success: true, sent: to.length, ok });
+  } catch (err) {
+    console.error('[meeting-invite]', err);
+    res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
+// POST /api/media — register a media file (audio/video/screen) with access control
+app.post('/api/media', authMiddleware, async (req, res) => {
+  try {
+    if (!req.user) return res.status(401).json({ success: false, error: 'Unauthorized.' });
+    const { channelId, messageId, kind, url, mimeType, sizeBytes } = req.body;
+    if (!channelId || !kind || !url) {
+      return res.status(400).json({ success: false, error: 'channelId, kind, and url are required.' });
+    }
+    const file = new MediaFile({
+      ownerEmail: req.user.email,
+      channelId,
+      messageId: messageId || null,
+      kind: ['audio', 'video', 'screen'].includes(kind) ? kind : 'audio',
+      url,
+      mimeType: mimeType || '',
+      sizeBytes: sizeBytes || 0,
+    });
+    const saved = await file.save();
+    res.json({ success: true, mediaId: saved._id.toString() });
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
+// GET /api/media/:id — verify access before returning media URL
+app.get('/api/media/:id', authMiddleware, async (req, res) => {
+  try {
+    if (!req.user) return res.status(401).json({ success: false, error: 'Unauthorized.' });
+    const file = await MediaFile.findById(req.params.id).lean();
+    if (!file) return res.status(404).json({ success: false, error: 'Media file not found.' });
+
+    const isOwner = file.ownerEmail.toLowerCase() === req.user.email.toLowerCase();
+    const isAdmin = req.user.role === 'Admin';
+    if (!isOwner && !isAdmin) {
+      return res.status(403).json({ success: false, error: 'Access denied. Only the sender and admin can access this recording.' });
+    }
+
+    res.json({ success: true, url: file.url, kind: file.kind, mimeType: file.mimeType });
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
 // POST /api/auth/login — validate credentials, returns user object
 app.post('/api/auth/login', async (req, res) => {
   try {
@@ -386,6 +1079,16 @@ app.post('/api/auth/login', async (req, res) => {
         JWT_SECRET,
         { expiresIn: JWT_EXPIRY }
       );
+      // Record login event for hardcoded accounts too
+      try {
+        const dateStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+        await LoginEvent.findOneAndUpdate(
+          { email: emailClean, dateStr },
+          { $set: { name: hardcoded.name, loginAt: new Date() } },
+          { upsert: true }
+        );
+        io.emit('login_status_updated', { email: emailClean, dateStr, loggedIn: true });
+      } catch (_) {}
       return res.json({ success: true, user: hardcoded, token });
     }
 
@@ -411,6 +1114,18 @@ app.post('/api/auth/login', async (req, res) => {
       JWT_SECRET,
       { expiresIn: JWT_EXPIRY }
     );
+
+    // Record login event
+    try {
+      const dateStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+      await LoginEvent.findOneAndUpdate(
+        { email: emailClean, dateStr },
+        { $set: { name: request.name, loginAt: new Date() } },
+        { upsert: true }
+      );
+      io.emit('login_status_updated', { email: emailClean, dateStr, loggedIn: true });
+    } catch (_) {}
+
     return res.json({
       success: true,
       user: { email: request.email, name: request.name, role: request.role },
@@ -471,13 +1186,9 @@ app.post('/api/auth/forgot-password', async (req, res) => {
     await ResetCode.deleteMany({ email: emailClean });
     await new ResetCode({ email: emailClean, code, expiresAt }).save();
 
-    const { testUrl } = await sendResetEmail(emailClean, request.name, code);
+    await sendResetEmail(emailClean, request.name, code);
 
-    res.json({
-      success: true,
-      message: GENERIC_OK,
-      ...(testUrl ? { previewUrl: testUrl } : {}),
-    });
+    res.json({ success: true, message: GENERIC_OK });
   } catch (err) {
     console.error('[forgot-password]', err);
     res.status(500).json({ success: false, error: String(err) });
@@ -631,11 +1342,24 @@ async function buildDigestHtml(since) {
 
 async function sendDigestEmails(since) {
   const html = await buildDigestHtml(since);
-  const to = VALID_ACCOUNTS.map((a) => ({ email: a.email, name: a.name }));
+
+  // ── Build recipient list: hardcoded + ALL approved DB users ──────────
+  // Previously only VALID_ACCOUNTS got the digest — new users were excluded.
+  const toMap = new Map(VALID_ACCOUNTS.map((a) => [a.email, { email: a.email, name: a.name }]));
+  try {
+    const dbUsers = await AccessRequest.find({ status: 'approved' }).lean();
+    for (const u of dbUsers) {
+      if (!toMap.has(u.email)) toMap.set(u.email, { email: u.email, name: u.name });
+    }
+  } catch (e) {
+    console.warn('[digest] Could not fetch DB users for digest:', e.message);
+  }
+  const to = Array.from(toMap.values());
+
   const subject = `EduTechExOS: Daily Team Digest — ${new Date().toLocaleDateString('en-IN', { day: 'numeric', month: 'short' })}`;
   const { ok } = await sendBrevoEmail({ to, subject, html });
   const recipients = to.map((r) => r.email).join(', ');
-  console.log(`[digest] Brevo send ${ok ? 'OK' : 'FAILED'} → ${recipients}`);
+  console.log(`[digest] Brevo send ${ok ? 'OK' : 'FAILED'} → ${to.length} recipients: ${recipients}`);
   return { recipients };
 }
 
@@ -652,75 +1376,99 @@ app.post('/api/digest', async (req, res) => {
 });
 
 // ── Cron: send digest daily at 09:00 IST = 03:30 UTC ─────────────────────────
-// Uses a simple setInterval (≈ 24 h) so we don't need an extra npm package.
-// For precise scheduling install node-cron and replace this block.
-(function scheduleDailyDigest() {
-  function msUntilNext0330UTC() {
-    const now  = new Date();
-    const next = new Date(now);
-    next.setUTCHours(3, 30, 0, 0);
-    if (next <= now) next.setUTCDate(next.getUTCDate() + 1);
-    return next.getTime() - now.getTime();
-  }
+// Uses node-cron for reliable scheduling that survives restarts and doesn't
+// drift like the old setTimeout approach.
+const cron = require('node-cron');
 
-  function arm() {
-    const delay = msUntilNext0330UTC();
-    console.log(`[digest-cron] Next digest in ${Math.round(delay / 60000)} min`);
-    setTimeout(async () => {
-      try {
-        const result = await sendDigestEmails();
-        console.log(`[digest-cron] Digest sent → ${result.recipients}`);
-        if (result.testUrl) console.log(`[digest-cron] Preview: ${result.testUrl}`);
-      } catch (err) {
-        console.error('[digest-cron] Failed:', err);
-      }
-      arm(); // schedule the next day
-    }, delay);
+cron.schedule('30 3 * * *', async () => {
+  console.log('[digest-cron] Firing daily digest at 03:30 UTC (09:00 IST)');
+  try {
+    const result = await sendDigestEmails();
+    console.log(`[digest-cron] Digest sent → ${result.recipients}`);
+    if (result.testUrl) console.log(`[digest-cron] Preview: ${result.testUrl}`);
+  } catch (err) {
+    console.error('[digest-cron] Failed:', err);
   }
+}, {
+  timezone: 'UTC',
+});
 
-  arm();
-})();
+console.log('[digest-cron] Scheduled daily digest at 03:30 UTC (09:00 IST) via node-cron');
 
 // ─── Message Routes ────────────────────────────────────────────────────────────
 
-// GET Messages (grouped by channel — shared, not filtered per-user)
+// ── Message formatter helper ──────────────────────────────────────────────────
+function formatMessage(msg, requestingUser) {
+  const { _id, __v, ...rest } = msg;
+  // Skip messages hidden for this specific user
+  if (requestingUser && (rest.deletedForUsers || []).includes(requestingUser)) return null;
+  // Soft-deleted for everyone — return placeholder (WhatsApp style)
+  if (rest.deletedForEveryone) {
+    return {
+      id: _id.toString(),
+      channelId: rest.channelId,
+      sender: rest.sender,
+      initials: rest.initials,
+      color: rest.color,
+      timestamp: rest.timestamp instanceof Date ? rest.timestamp.toISOString() : rest.timestamp,
+      parentId: rest.parentId,
+      isDeleted: true,
+      text: '',
+    };
+  }
+  return {
+    ...rest,
+    id: _id.toString(),
+    timestamp: rest.timestamp instanceof Date ? rest.timestamp.toISOString() : rest.timestamp,
+    ...(rest.editedAt ? { editedAt: rest.editedAt instanceof Date ? rest.editedAt.toISOString() : rest.editedAt } : {}),
+  };
+}
+
+// GET Messages — supports two modes:
+//   1. ?channelId=X[&before=ISO_TIMESTAMP][&limit=N]  → paginated single-channel
+//   2. (no channelId) → last PAGE_SIZE messages per channel for initial load
+const PAGE_SIZE = 50;
+
 app.get('/api/messages', async (req, res) => {
   try {
     const requestingUser = getUserEmail(req);
-    const messages = await Message.find({}).sort({ timestamp: 1 }).lean();
-    const grouped = {};
-    for (const msg of messages) {
-      const channelId = msg.channelId;
-      if (!grouped[channelId]) grouped[channelId] = [];
-      const { _id, __v, ...rest } = msg;
+    const { channelId, before, limit } = req.query;
+    const pageSize = Math.min(parseInt(limit) || PAGE_SIZE, 100);
 
-      // Skip messages hidden for this specific user
-      if (requestingUser && (rest.deletedForUsers || []).includes(requestingUser)) continue;
+    if (channelId) {
+      // ── Paginated single-channel load ───────────────────────────────────────
+      const filter = { channelId: String(channelId) };
+      if (before) filter.timestamp = { $lt: new Date(before) };
 
-      // Soft-deleted for everyone — return placeholder (WhatsApp style)
-      if (rest.deletedForEveryone) {
-        grouped[channelId].push({
-          id: _id.toString(),
-          channelId,
-          sender: rest.sender,
-          initials: rest.initials,
-          color: rest.color,
-          timestamp: rest.timestamp instanceof Date ? rest.timestamp.toISOString() : rest.timestamp,
-          parentId: rest.parentId,
-          isDeleted: true,
-          text: '',
-        });
-        continue;
-      }
+      const msgs = await Message.find(filter)
+        .sort({ timestamp: -1 })
+        .limit(pageSize + 1)   // fetch one extra to detect hasMore
+        .lean();
 
-      grouped[channelId].push({
-        ...rest,
-        id: _id.toString(),
-        timestamp: rest.timestamp instanceof Date ? rest.timestamp.toISOString() : rest.timestamp,
-        ...(rest.editedAt ? { editedAt: rest.editedAt instanceof Date ? rest.editedAt.toISOString() : rest.editedAt } : {}),
-      });
+      const hasMore = msgs.length > pageSize;
+      const page = msgs.slice(0, pageSize).reverse(); // oldest-first for the client
+
+      const formatted = page.map((m) => formatMessage(m, requestingUser)).filter(Boolean);
+      return res.json({ success: true, messages: formatted, hasMore, channelId });
     }
-    res.json({ success: true, messages: grouped });
+
+    // ── Initial load: last PAGE_SIZE per channel ────────────────────────────
+    const allChannelIds = await Message.distinct('channelId');
+    const grouped  = {};
+    const hasMoreMap = {};
+
+    for (const chId of allChannelIds) {
+      const msgs = await Message.find({ channelId: chId })
+        .sort({ timestamp: -1 })
+        .limit(pageSize + 1)
+        .lean();
+
+      hasMoreMap[chId] = msgs.length > pageSize;
+      const page = msgs.slice(0, pageSize).reverse();
+      grouped[chId] = page.map((m) => formatMessage(m, requestingUser)).filter(Boolean);
+    }
+
+    res.json({ success: true, messages: grouped, hasMore: hasMoreMap });
   } catch (err) {
     console.error('[GET /api/messages] Error:', err);
     res.status(500).json({ success: false, error: String(err) });
@@ -1077,175 +1825,6 @@ app.post('/api/notifications', async (req, res) => {
   }
 });
 
-// ─── Integrations / Webhooks ──────────────────────────────────────────────────
-
-const crypto = require('crypto');
-
-// Helper: post a bot message to a channel and broadcast via Socket.IO
-async function postBotMessage(channelId, text, color = '#4f46e5') {
-  const msg = new Message({
-    channelId,
-    sender: 'EduTechExOS Bot',
-    initials: 'EB',
-    color,
-    text,
-    timestamp: new Date(),
-  });
-  const saved = await msg.save();
-  const { _id, __v, ...rest } = saved.toObject();
-  const payload = { ...rest, id: _id.toString(), timestamp: rest.timestamp.toISOString() };
-  io.to(channelId).emit('new_message', { channelId, message: payload });
-  return payload;
-}
-
-// Format GitHub event into a readable message
-function formatGithubEvent(event, body) {
-  const repo = body.repository?.full_name || 'unknown/repo';
-  const repoUrl = body.repository?.html_url || '#';
-
-  switch (event) {
-    case 'push': {
-      const branch = (body.ref || '').replace('refs/heads/', '');
-      const pusher = body.pusher?.name || 'Someone';
-      const commits = (body.commits || []).slice(0, 3);
-      const commitLines = commits.map(c => `• \`${c.id?.slice(0,7)}\` ${c.message?.split('\n')[0]}`).join('\n');
-      const more = (body.commits?.length || 0) > 3 ? `\n_...and ${body.commits.length - 3} more_` : '';
-      return `🔀 **${pusher}** pushed to \`${branch}\` in [${repo}](${repoUrl})\n${commitLines}${more}`;
-    }
-    case 'pull_request': {
-      const action = body.action;
-      const pr = body.pull_request;
-      const user = pr?.user?.login || 'Someone';
-      const icons = { opened: '🔁', closed: pr?.merged ? '✅' : '❌', reopened: '🔄', review_requested: '👀' };
-      const icon = icons[action] || '🔁';
-      return `${icon} **PR ${action}**: [${pr?.title}](${pr?.html_url})\nby **${user}** → \`${pr?.base?.ref}\` ← \`${pr?.head?.ref}\``;
-    }
-    case 'issues': {
-      const action = body.action;
-      const issue = body.issue;
-      const user = issue?.user?.login || 'Someone';
-      const icons = { opened: '🐛', closed: '✅', reopened: '🔄' };
-      const icon = icons[action] || '🐛';
-      return `${icon} **Issue ${action}**: [${issue?.title}](${issue?.html_url})\nby **${user}** in [${repo}](${repoUrl})`;
-    }
-    case 'issue_comment': {
-      const issue = body.issue;
-      const comment = body.comment;
-      const user = comment?.user?.login || 'Someone';
-      const preview = (comment?.body || '').slice(0, 120);
-      return `💬 **${user}** commented on [#${issue?.number} ${issue?.title}](${comment?.html_url})\n> ${preview}`;
-    }
-    case 'release': {
-      const rel = body.release;
-      const action = body.action;
-      const user = rel?.author?.login || 'Someone';
-      return `🚀 **Release ${action}**: [${rel?.tag_name} — ${rel?.name}](${rel?.html_url})\nby **${user}** in [${repo}](${repoUrl})`;
-    }
-    case 'create': {
-      const type = body.ref_type;
-      const ref = body.ref;
-      const user = body.sender?.login || 'Someone';
-      return `✨ **${user}** created ${type} \`${ref}\` in [${repo}](${repoUrl})`;
-    }
-    case 'star': {
-      const user = body.sender?.login || 'Someone';
-      const count = body.repository?.stargazers_count;
-      return `⭐ **${user}** starred [${repo}](${repoUrl}) — now at **${count} stars**!`;
-    }
-    default:
-      return `⚙️ GitHub event \`${event}\` received from [${repo}](${repoUrl})`;
-  }
-}
-
-// GET /api/webhooks — list all webhook tokens (admin)
-app.get('/api/webhooks', authMiddleware, async (req, res) => {
-  try {
-    const tokens = await WebhookToken.find({}).sort({ createdAt: -1 }).lean();
-    res.json({ success: true, webhooks: tokens.map(({ _id, __v, ...t }) => ({ ...t, id: _id.toString() })) });
-  } catch (err) {
-    res.status(500).json({ success: false, error: String(err) });
-  }
-});
-
-// POST /api/webhooks — create a new webhook token
-app.post('/api/webhooks', authMiddleware, async (req, res) => {
-  try {
-    const { channelId, name, type, secret } = req.body;
-    if (!channelId || !name) return res.status(400).json({ success: false, error: 'channelId and name required' });
-    const token = crypto.randomBytes(24).toString('hex');
-    const wh = new WebhookToken({ token, channelId, name, type: type || 'generic', secret: secret || '' });
-    const saved = await wh.save();
-    const { _id, __v, ...rest } = saved.toObject();
-    res.json({ success: true, webhook: { ...rest, id: _id.toString() } });
-  } catch (err) {
-    res.status(500).json({ success: false, error: String(err) });
-  }
-});
-
-// DELETE /api/webhooks/:id — delete a webhook token
-app.delete('/api/webhooks/:id', authMiddleware, async (req, res) => {
-  try {
-    await WebhookToken.findByIdAndDelete(req.params.id);
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ success: false, error: String(err) });
-  }
-});
-
-// PATCH /api/webhooks/:id — toggle active
-app.patch('/api/webhooks/:id', authMiddleware, async (req, res) => {
-  try {
-    const updated = await WebhookToken.findByIdAndUpdate(req.params.id, { $set: req.body }, { new: true }).lean();
-    if (!updated) return res.status(404).json({ success: false, error: 'Not found' });
-    const { _id, __v, ...rest } = updated;
-    res.json({ success: true, webhook: { ...rest, id: _id.toString() } });
-  } catch (err) {
-    res.status(500).json({ success: false, error: String(err) });
-  }
-});
-
-// POST /webhook/github/:token — GitHub webhook receiver
-app.post('/webhook/github/:token', express.json({ type: '*/*' }), async (req, res) => {
-  try {
-    const wh = await WebhookToken.findOne({ token: req.params.token, type: 'github', active: true });
-    if (!wh) return res.status(404).json({ error: 'Webhook not found or inactive' });
-
-    // Verify HMAC signature if secret is set
-    if (wh.secret) {
-      const sig = req.headers['x-hub-signature-256'] || '';
-      const expected = 'sha256=' + crypto.createHmac('sha256', wh.secret).update(JSON.stringify(req.body)).digest('hex');
-      if (sig !== expected) return res.status(401).json({ error: 'Invalid signature' });
-    }
-
-    const event = req.headers['x-github-event'] || 'unknown';
-    const text = formatGithubEvent(event, req.body);
-    await postBotMessage(wh.channelId, text, '#24292f');
-    await WebhookToken.findByIdAndUpdate(wh._id, { lastUsed: new Date() });
-    res.json({ success: true });
-  } catch (err) {
-    console.error('[github-webhook]', err);
-    res.status(500).json({ error: String(err) });
-  }
-});
-
-// POST /webhook/incoming/:token — generic incoming webhook (Zapier, Make, etc.)
-app.post('/webhook/incoming/:token', express.json({ type: '*/*' }), async (req, res) => {
-  try {
-    const wh = await WebhookToken.findOne({ token: req.params.token, type: 'generic', active: true });
-    if (!wh) return res.status(404).json({ error: 'Webhook not found or inactive' });
-
-    const { text, title, color } = req.body;
-    if (!text) return res.status(400).json({ error: 'text field required' });
-
-    const message = title ? `**${title}**\n${text}` : text;
-    await postBotMessage(wh.channelId, message, color || '#4f46e5');
-    await WebhookToken.findByIdAndUpdate(wh._id, { lastUsed: new Date() });
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: String(err) });
-  }
-});
-
 // ─── Generic email relay endpoint ─────────────────────────────────────────────
 // Called by Vercel server actions so ALL emails go through Render's stable IP.
 // POST /api/email  { to, subject, htmlContent }
@@ -1262,6 +1841,368 @@ app.post('/api/email', async (req, res) => {
   } catch (err) {
     res.status(500).json({ success: false, error: String(err) });
   }
+});
+
+// ─── Webhook CRUD ─────────────────────────────────────────────────────────────
+
+const crypto = require('crypto');
+
+function generateWebhookToken() {
+  return crypto.randomBytes(24).toString('hex'); // 48-char hex token
+}
+
+// Helper: post a bot message to a channel via Socket.IO + MongoDB
+async function postBotMessage(channelId, text) {
+  const msg = new Message({
+    channelId,
+    sender:   'EduTechExOS Bot',
+    initials: 'EB',
+    color:    '#4f46e5',
+    text,
+    timestamp: new Date(),
+  });
+  const saved = await msg.save();
+  const { _id, __v, ...rest } = saved.toObject();
+  const payload = {
+    ...rest,
+    id: _id.toString(),
+    timestamp: rest.timestamp instanceof Date ? rest.timestamp.toISOString() : rest.timestamp,
+  };
+  io.to(channelId).emit('new_message', { channelId, message: payload });
+  return payload;
+}
+
+// GET /api/webhooks — list all webhooks
+app.get('/api/webhooks', authMiddleware, async (req, res) => {
+  try {
+    if (!req.user) return res.status(401).json({ success: false, error: 'Unauthorized' });
+    const hooks = await Webhook.find({}).sort({ createdAt: -1 }).lean();
+    const formatted = hooks.map(({ _id, __v, ...rest }) => ({
+      ...rest,
+      id: _id.toString(),
+      createdAt: rest.createdAt instanceof Date ? rest.createdAt.toISOString() : rest.createdAt,
+      lastUsed:  rest.lastUsed  instanceof Date ? rest.lastUsed.toISOString()  : rest.lastUsed,
+    }));
+    res.json({ success: true, webhooks: formatted });
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
+// POST /api/webhooks — create a new webhook
+app.post('/api/webhooks', authMiddleware, async (req, res) => {
+  try {
+    if (!req.user) return res.status(401).json({ success: false, error: 'Unauthorized' });
+    const { name, channelId, type, secret } = req.body;
+    if (!name || !channelId || !type) {
+      return res.status(400).json({ success: false, error: 'name, channelId, and type are required' });
+    }
+    const token = generateWebhookToken();
+    const hook = new Webhook({ name, channelId, type, token, secret: secret || '' });
+    const saved = await hook.save();
+    const { _id, __v, ...rest } = saved.toObject();
+    res.json({
+      success: true,
+      webhook: {
+        ...rest,
+        id: _id.toString(),
+        createdAt: rest.createdAt instanceof Date ? rest.createdAt.toISOString() : rest.createdAt,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
+// PATCH /api/webhooks/:id — toggle active / update name
+app.patch('/api/webhooks/:id', authMiddleware, async (req, res) => {
+  try {
+    if (!req.user) return res.status(401).json({ success: false, error: 'Unauthorized' });
+    const { id } = req.params;
+    const updates = {};
+    if (req.body.active  !== undefined) updates.active  = req.body.active;
+    if (req.body.name    !== undefined) updates.name    = req.body.name;
+    if (req.body.secret  !== undefined) updates.secret  = req.body.secret;
+    const updated = await Webhook.findByIdAndUpdate(id, { $set: updates }, { new: true }).lean();
+    if (!updated) return res.status(404).json({ success: false, error: 'Webhook not found' });
+    const { _id, __v, ...rest } = updated;
+    res.json({
+      success: true,
+      webhook: {
+        ...rest,
+        id: _id.toString(),
+        createdAt: rest.createdAt instanceof Date ? rest.createdAt.toISOString() : rest.createdAt,
+        lastUsed:  rest.lastUsed  instanceof Date ? rest.lastUsed.toISOString()  : rest.lastUsed,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
+// DELETE /api/webhooks/:id
+app.delete('/api/webhooks/:id', authMiddleware, async (req, res) => {
+  try {
+    if (!req.user) return res.status(401).json({ success: false, error: 'Unauthorized' });
+    await Webhook.findByIdAndDelete(req.params.id);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
+// ─── Webhook Receivers ────────────────────────────────────────────────────────
+
+// POST /webhook/github/:token  — receives GitHub events
+app.post('/webhook/github/:token', express.json({ type: '*/*' }), async (req, res) => {
+  try {
+    const hook = await Webhook.findOne({ token: req.params.token, type: 'github', active: true }).lean();
+    if (!hook) return res.status(404).json({ error: 'Webhook not found or inactive' });
+
+    // Optionally verify HMAC signature
+    if (hook.secret) {
+      const sig = req.headers['x-hub-signature-256'];
+      const expected = 'sha256=' + crypto.createHmac('sha256', hook.secret).update(JSON.stringify(req.body)).digest('hex');
+      if (sig !== expected) return res.status(401).json({ error: 'Invalid signature' });
+    }
+
+    const event   = req.headers['x-github-event'] || 'push';
+    const payload = req.body;
+    let text = '';
+
+    if (event === 'push') {
+      const repo    = payload.repository?.full_name ?? 'repo';
+      const branch  = (payload.ref || '').replace('refs/heads/', '');
+      const pusher  = payload.pusher?.name ?? 'someone';
+      const commits = (payload.commits || []).length;
+      const msg     = payload.head_commit?.message?.split('\n')[0] ?? '';
+      text = `🔀 **[${repo}]** ${pusher} pushed ${commits} commit${commits !== 1 ? 's' : ''} to \`${branch}\`${msg ? `: "${msg}"` : ''}`;
+    } else if (event === 'pull_request') {
+      const pr     = payload.pull_request;
+      const action = payload.action;
+      const repo   = payload.repository?.full_name ?? 'repo';
+      text = `🔁 **[${repo}]** PR #${pr?.number} **${action}**: "${pr?.title}" by ${pr?.user?.login ?? 'someone'} → ${pr?.html_url}`;
+    } else if (event === 'issues') {
+      const issue  = payload.issue;
+      const action = payload.action;
+      const repo   = payload.repository?.full_name ?? 'repo';
+      text = `🐛 **[${repo}]** Issue #${issue?.number} **${action}**: "${issue?.title}" → ${issue?.html_url}`;
+    } else if (event === 'release') {
+      const release = payload.release;
+      const repo    = payload.repository?.full_name ?? 'repo';
+      text = `🚀 **[${repo}]** Release **${release?.tag_name}** published: "${release?.name}" → ${release?.html_url}`;
+    } else {
+      text = `⚡ **GitHub** event \`${event}\` received from ${payload.repository?.full_name ?? 'unknown repo'}`;
+    }
+
+    await Webhook.findByIdAndUpdate(hook._id, { lastUsed: new Date() });
+    await postBotMessage(hook.channelId, text);
+    res.status(200).json({ success: true });
+  } catch (err) {
+    console.error('[webhook/github]', err);
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+// POST /webhook/incoming/:token  — generic receiver (Zapier, Make, IFTTT, etc.)
+// Expects JSON body: { text: string, title?: string, color?: string }
+app.post('/webhook/incoming/:token', express.json({ type: '*/*' }), async (req, res) => {
+  try {
+    const hook = await Webhook.findOne({ token: req.params.token, type: 'generic', active: true }).lean();
+    if (!hook) return res.status(404).json({ error: 'Webhook not found or inactive' });
+
+    const { text, title } = req.body;
+    if (!text) return res.status(400).json({ error: '`text` field is required in payload' });
+
+    const message = title ? `**${title}**\n${text}` : text;
+    await Webhook.findByIdAndUpdate(hook._id, { lastUsed: new Date() });
+    await postBotMessage(hook.channelId, message);
+    res.status(200).json({ success: true });
+  } catch (err) {
+    console.error('[webhook/incoming]', err);
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+// ─── User Settings ────────────────────────────────────────────────────────────
+
+const SETTINGS_FIELDS = [
+  'displayName', 'avatarEmoji', 'status', 'meetLink',
+  'emailNotifications', 'desktopNotifications', 'soundNotifications',
+  'compactChat', 'fontSize', 'enterToSend', 'darkMode',
+];
+
+// GET /api/settings — load current user's settings
+app.get('/api/settings', authMiddleware, async (req, res) => {
+  try {
+    if (!req.user) return res.status(401).json({ success: false, error: 'Unauthorized.' });
+    const doc = await UserSettings.findOne({ email: req.user.email.toLowerCase() }).lean();
+    res.json({ success: true, settings: doc || null });
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
+// PUT /api/settings — upsert current user's settings
+app.put('/api/settings', authMiddleware, async (req, res) => {
+  try {
+    if (!req.user) return res.status(401).json({ success: false, error: 'Unauthorized.' });
+    const email = req.user.email.toLowerCase();
+    const updateFields = {};
+    SETTINGS_FIELDS.forEach((key) => { if (req.body[key] !== undefined) updateFields[key] = req.body[key]; });
+    const doc = await UserSettings.findOneAndUpdate(
+      { email },
+      { $set: updateFields },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    ).lean();
+    res.json({ success: true, settings: doc });
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
+// ─── Pinned Messages ──────────────────────────────────────────────────────────
+
+// GET /api/pinned — all pinned message IDs grouped by channel
+app.get('/api/pinned', authMiddleware, async (req, res) => {
+  try {
+    const pins = await PinnedMessage.find({}).sort({ pinnedAt: 1 }).lean();
+    const grouped = {};
+    pins.forEach((p) => {
+      if (!grouped[p.channelId]) grouped[p.channelId] = [];
+      if (!grouped[p.channelId].includes(p.messageId)) grouped[p.channelId].push(p.messageId);
+    });
+    res.json({ success: true, pinnedMessageIds: grouped });
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
+// POST /api/pinned — pin a message
+app.post('/api/pinned', authMiddleware, async (req, res) => {
+  try {
+    const { channelId, messageId } = req.body;
+    if (!channelId || !messageId) {
+      return res.status(400).json({ success: false, error: 'channelId and messageId are required.' });
+    }
+    const pinnedBy = req.user?.email || 'unknown';
+    await PinnedMessage.findOneAndUpdate(
+      { channelId, messageId },
+      { $setOnInsert: { channelId, messageId, pinnedBy, pinnedAt: new Date() } },
+      { upsert: true }
+    );
+    // Broadcast so all clients show the pin in real-time
+    io.emit('message_pinned', { channelId, messageId });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
+// DELETE /api/pinned/:channelId/:messageId — unpin a message
+app.delete('/api/pinned/:channelId/:messageId', authMiddleware, async (req, res) => {
+  try {
+    const { channelId, messageId } = req.params;
+    await PinnedMessage.deleteOne({ channelId, messageId });
+    io.emit('message_unpinned', { channelId, messageId });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
+// ─── Workspace Channels ───────────────────────────────────────────────────────
+
+// GET /api/channels — returns all workspace channels (seeds defaults if empty)
+app.get('/api/channels', authMiddleware, async (req, res) => {
+  try {
+    let channels = await WorkspaceChannel.find({}).sort({ order: 1 }).lean();
+    if (channels.length === 0) {
+      await WorkspaceChannel.insertMany(DEFAULT_WORKSPACE_CHANNELS);
+      channels = DEFAULT_WORKSPACE_CHANNELS;
+    }
+    const formatted = channels.map(({ _id, __v, createdAt, updatedAt, ...rest }) => ({
+      ...rest,
+      id: _id,
+      createdAt: createdAt instanceof Date ? createdAt.toISOString() : createdAt,
+    }));
+    res.json({ success: true, channels: formatted });
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
+// POST /api/channels — admin creates a new workspace channel
+app.post('/api/channels', authMiddleware, async (req, res) => {
+  try {
+    if (!req.user) return res.status(401).json({ success: false, error: 'Unauthorized.' });
+    const { name, description } = req.body;
+    if (!name) return res.status(400).json({ success: false, error: 'name is required.' });
+    const id = name.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+    const exists = await WorkspaceChannel.findById(id).lean();
+    if (exists) return res.status(409).json({ success: false, error: 'A channel with this name already exists.' });
+    const count = await WorkspaceChannel.countDocuments();
+    const channel = new WorkspaceChannel({
+      _id: id, name: id, description: description || '',
+      isDefault: false, createdBy: req.user.email, order: count,
+    });
+    const saved = await channel.save();
+    const { _id, __v, ...rest } = saved.toObject();
+    io.emit('channel_created', { ...rest, id: _id });
+    res.json({ success: true, channel: { ...rest, id: _id } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
+// PATCH /api/channels/:id — update channel name/description (admin only)
+app.patch('/api/channels/:id', authMiddleware, async (req, res) => {
+  try {
+    if (!req.user || req.user.role !== 'Admin') {
+      return res.status(403).json({ success: false, error: 'Only admins can edit channels.' });
+    }
+    const updates = {};
+    if (req.body.name)        updates.name        = req.body.name;
+    if (req.body.description !== undefined) updates.description = req.body.description;
+    const updated = await WorkspaceChannel.findByIdAndUpdate(
+      req.params.id, { $set: updates }, { new: true }
+    ).lean();
+    if (!updated) return res.status(404).json({ success: false, error: 'Channel not found.' });
+    const { _id, __v, ...rest } = updated;
+    res.json({ success: true, channel: { ...rest, id: _id } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
+// DELETE /api/channels/:id — delete a non-default channel (admin only)
+app.delete('/api/channels/:id', authMiddleware, async (req, res) => {
+  try {
+    if (!req.user || req.user.role !== 'Admin') {
+      return res.status(403).json({ success: false, error: 'Only admins can delete channels.' });
+    }
+    const channel = await WorkspaceChannel.findById(req.params.id).lean();
+    if (!channel) return res.status(404).json({ success: false, error: 'Channel not found.' });
+    if (channel.isDefault) return res.status(400).json({ success: false, error: 'Default channels cannot be deleted.' });
+    await WorkspaceChannel.findByIdAndDelete(req.params.id);
+    io.emit('channel_deleted', { channelId: req.params.id });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
+// ── Global error handler (logs to console + Sentry if configured) ─────────────
+app.use((err, req, res, next) => {
+  console.error('[server error]', err);
+  // Forward to Sentry if DSN is configured
+  if (process.env.SENTRY_DSN) {
+    try {
+      const Sentry = require('@sentry/node');
+      Sentry.captureException(err, { extra: { url: req.url, method: req.method } });
+    } catch (_) {}
+  }
+  res.status(err.status || 500).json({ error: err.message || 'Internal server error' });
 });
 
 // Start Server
