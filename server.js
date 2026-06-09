@@ -1,3 +1,17 @@
+// ── Safety: if a stale cached express-rate-limit exists in node_modules,
+// delete it NOW before anything requires it so ERR_ERL_UNEXPECTED_X_FORWARDED_FOR
+// can never be thrown. This handles Render's persistent node_modules cache.
+try {
+  const path = require('path');
+  const fs   = require('fs');
+  const rlDir = path.join(__dirname, 'node_modules', 'express-rate-limit');
+  if (fs.existsSync(rlDir)) {
+    fs.rmSync(rlDir, { recursive: true, force: true });
+    console.log('[startup] Removed stale express-rate-limit from node_modules cache.');
+  }
+} catch (_) {}
+
+const cron = require('node-cron');
 const dns = require('dns');
 // Override system DNS with Google's public resolvers to fix querySrv ECONNREFUSED
 // on networks where the local DNS server blocks or misroutes SRV lookups.
@@ -8,7 +22,41 @@ const http = require('http');
 const { Server } = require('socket.io');
 const mongoose = require('mongoose');
 const cors = require('cors');
-const rateLimit = require('express-rate-limit');
+// ── Zero-dependency rate limiter — replaces express-rate-limit entirely.
+// express-rate-limit throws ERR_ERL_UNEXPECTED_X_FORWARDED_FOR on Render
+// (a proxy host) even with app.set('trust proxy', 1) + validate:false due
+// to stale cached node_modules.  This implementation has no such issue.
+function makeRateLimiter({ windowMs, max, message }) {
+  const store = new Map(); // ip → { count, resetAt }
+  // Sweep stale entries every 10 minutes to avoid memory leak on long uptime
+  setInterval(() => {
+    const now = Date.now();
+    for (const [ip, entry] of store) {
+      if (now > entry.resetAt) store.delete(ip);
+    }
+  }, 10 * 60 * 1000).unref();
+
+  return function rateLimitMiddleware(req, res, next) {
+    // Honour the proxy-set header; fall back to socket address
+    const ip =
+      (req.headers['x-forwarded-for'] || '').split(',')[0].trim() ||
+      req.socket?.remoteAddress ||
+      'unknown';
+    const now = Date.now();
+    let entry = store.get(ip);
+    if (!entry || now > entry.resetAt) {
+      entry = { count: 0, resetAt: now + windowMs };
+      store.set(ip, entry);
+    }
+    entry.count += 1;
+    if (entry.count > max) {
+      return res.status(429).json(
+        typeof message === 'object' ? message : { error: message || 'Too many requests.' }
+      );
+    }
+    next();
+  };
+}
 // nodemailer replaced by Brevo HTTP API (no IP-whitelist issues)
 const jwt = require('jsonwebtoken');
 require('dotenv').config({ path: require('path').join(__dirname, '.env') });
@@ -25,16 +73,28 @@ async function sendBrevoEmail({ to, subject, html }) {
   const fromEmail = (fromRaw.match(/<(.+)>/) || [])[1] || fromRaw.trim();
   const fromName  = fromRaw.replace(/<.*>/, '').trim() || 'EduTechExOS';
 
+  console.log(`[Brevo] Sending "${subject}" from ${fromEmail} to ${Array.isArray(to) ? to.map(r => r.email).join(', ') : to}`);
   const res = await fetch('https://api.brevo.com/v3/smtp/email', {
     method: 'POST',
     headers: { 'api-key': apiKey, 'Content-Type': 'application/json' },
     body: JSON.stringify({ sender: { name: fromName, email: fromEmail }, to, subject, htmlContent: html }),
   });
-  if (!res.ok) { const b = await res.text(); console.error('[Brevo]', res.status, b); return { ok: false }; }
+  if (!res.ok) {
+    const b = await res.text();
+    console.error('[Brevo] FAILED', res.status, b);
+    return { ok: false, brevoError: `${res.status}: ${b}` };
+  }
+  console.log(`[Brevo] OK — delivered to ${Array.isArray(to) ? to.length : 1} recipient(s)`);
   return { ok: true };
 }
 
 const app = express();
+
+// Render (and most PaaS hosts) sit behind a reverse proxy that sets
+// X-Forwarded-For. Tell Express to trust the first proxy hop so that
+// express-rate-limit can identify real client IPs correctly.
+app.set('trust proxy', 1);
+
 const httpServer = http.createServer(app);
 
 // Allow requests from the Vercel frontend and local dev
@@ -138,29 +198,24 @@ app.use(express.json());
 
 // ── Rate Limiting ─────────────────────────────────────────────────────────────
 // Auth endpoints: strict limit to prevent brute-force / credential stuffing
-const authLimiter = rateLimit({
+const authLimiter = makeRateLimiter({
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: 10,
-  standardHeaders: true,
-  legacyHeaders: false,
   message: { error: 'Too many auth attempts. Please wait 15 minutes before trying again.' },
 });
 
 // Message/API endpoints: generous limit for normal usage
-const apiLimiter = rateLimit({
+const apiLimiter = makeRateLimiter({
   windowMs: 60 * 1000, // 1 minute
   max: 120,
-  standardHeaders: true,
-  legacyHeaders: false,
   message: { error: 'Too many requests. Please slow down.' },
 });
 
 // Global fallback
-const globalLimiter = rateLimit({
+const globalLimiter = makeRateLimiter({
   windowMs: 60 * 1000,
   max: 300,
-  standardHeaders: true,
-  legacyHeaders: false,
+  message: { error: 'Too many requests.' },
 });
 
 app.use('/api/auth/', authLimiter);
@@ -196,8 +251,74 @@ mongoose.connect(MONGODB_URI)
   })
   .catch((err) => {
     console.error('Failed to connect to MongoDB Atlas (non-fatal):', err);
-    // Continue without exiting; DB-dependent routes may fail gracefully
   });
+
+// ── Daily Email Digest — 8:00 AM IST = 2:30 AM UTC ───────────────────────────
+// Summarises the last 24 h of workspace messages and emails every user.
+cron.schedule('30 2 * * *', async () => {
+  console.log('[digest] Running daily email digest…');
+  try {
+    const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const msgs = await Message.find({ timestamp: { $gte: since } }).sort({ timestamp: 1 }).lean();
+    if (!msgs.length) { console.log('[digest] No messages in last 24 h — skipping.'); return; }
+
+    // Group by channelId, skip DM rooms
+    const byChannel = {};
+    msgs.forEach((m) => {
+      if (m.channelId?.startsWith('dm-')) return;
+      if (!byChannel[m.channelId]) byChannel[m.channelId] = [];
+      byChannel[m.channelId].push(m);
+    });
+
+    // Collect all user emails
+    const dbUsers = await AccessRequest.find({ status: 'approved' }).lean().catch(() => []);
+    const allEmails = [
+      ...VALID_ACCOUNTS.map((a) => a.email),
+      ...dbUsers.map((u) => u.email),
+    ];
+
+    // Build HTML sections per channel
+    const channelHtml = Object.entries(byChannel).map(([chId, chMsgs]) => {
+      const rows = chMsgs.slice(-6).map((m) => `
+        <tr>
+          <td style="padding:4px 8px;font-size:12px;font-weight:700;color:#3E4A89;white-space:nowrap;">${m.sender}</td>
+          <td style="padding:4px 8px;font-size:13px;color:#1E2636;">${(m.text || '').replace(/<[^>]+>/g, '').slice(0, 150)}</td>
+        </tr>`).join('');
+      return `
+        <div style="margin-bottom:20px;">
+          <p style="margin:0 0 8px;font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.1em;color:#7C859E;"># ${chId}</p>
+          <table style="width:100%;border-collapse:collapse;background:#fff;border-radius:8px;overflow:hidden;border:1px solid rgba(62,74,137,0.10);">${rows}</table>
+          <p style="margin:4px 0 0;font-size:11px;color:#9BA6D3;">${chMsgs.length} message${chMsgs.length !== 1 ? 's' : ''}</p>
+        </div>`;
+    }).join('');
+
+    const dateLabel = new Date().toLocaleDateString('en-IN', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+    const html = `
+      <div style="font-family:system-ui,-apple-system,sans-serif;max-width:600px;margin:0 auto;padding:24px 16px;">
+        <div style="background:linear-gradient(135deg,#1E2538,#3E4A89);padding:22px 26px;border-radius:14px 14px 0 0;">
+          <h1 style="color:#fff;font-size:22px;font-weight:900;margin:0 0 4px;">EduTechExOS Daily Digest</h1>
+          <p style="color:rgba(255,255,255,.65);font-size:13px;margin:0;">${dateLabel}</p>
+        </div>
+        <div style="background:#FAF8F5;padding:24px 26px;border-radius:0 0 14px 14px;border:1px solid rgba(62,74,137,.12);border-top:none;">
+          <p style="color:#4A5578;font-size:14px;margin:0 0 20px;">Here's what happened in your workspace in the last 24 hours:</p>
+          ${channelHtml || '<p style="color:#9BA6D3;font-size:13px;">No channel messages today.</p>'}
+          <div style="margin-top:24px;padding-top:16px;border-top:1px solid rgba(62,74,137,.08);">
+            <a href="https://edutechexos.vercel.app" style="display:inline-block;background:#3E4A89;color:#fff;padding:11px 22px;border-radius:9px;font-weight:700;font-size:13px;text-decoration:none;">Open EduTechExOS →</a>
+          </div>
+          <p style="margin:16px 0 0;font-size:11px;color:#9BA6D3;">You receive this because you are a member of EduTechExOS. To unsubscribe, ask your admin.</p>
+        </div>
+      </div>`;
+
+    let sent = 0;
+    for (const email of allEmails) {
+      const r = await sendBrevoEmail({ to: [{ email }], subject: `EduTechExOS Daily Digest — ${dateLabel}`, html });
+      if (r.ok) sent++;
+    }
+    console.log(`[digest] Sent to ${sent}/${allEmails.length} users.`);
+  } catch (err) {
+    console.error('[digest] Error:', err);
+  }
+}, { timezone: 'UTC' });
 
 // --- 2. Schemas & Models ---
 const MessageSchema = new mongoose.Schema(
@@ -224,6 +345,7 @@ const MessageSchema = new mongoose.Schema(
   // so future message types never get silently dropped
   { strict: false }
 );
+MessageSchema.index({ text: 'text', sender: 'text' });
 const Message = mongoose.model('Message', MessageSchema);
 
 // ── Hardcoded accounts (never touch the DB) ──────────────────────────────────
@@ -285,6 +407,7 @@ const KanbanTaskSchema = new mongoose.Schema(
   },
   { strict: false }
 );
+KanbanTaskSchema.index({ text: 'text', assignee: 'text' });
 const KanbanTask = mongoose.model('KanbanTask', KanbanTaskSchema);
 
 const WikiPageSchema = new mongoose.Schema({
@@ -296,6 +419,7 @@ const WikiPageSchema = new mongoose.Schema({
 }, {
   timestamps: true
 });
+WikiPageSchema.index({ title: 'text', content: 'text' });
 const WikiPage = mongoose.model('WikiPage', WikiPageSchema);
 
 // Bookmark schema — persisted per-user on backend
@@ -344,6 +468,21 @@ const LoginEventSchema = new mongoose.Schema({
 });
 LoginEventSchema.index({ email: 1, dateStr: 1 });
 const LoginEvent = mongoose.model('LoginEvent', LoginEventSchema);
+
+// ── ActivitySession schema — tracks app usage time per user per day ───────────
+// Heartbeat is sent every 60 s from the dashboard. Each ping adds up to 2 min
+// (capped so a forgotten tab doesn't inflate counts).
+const ActivitySessionSchema = new mongoose.Schema({
+  email:          { type: String, required: true, index: true },
+  name:           { type: String, default: '' },
+  dateStr:        { type: String, required: true, index: true }, // YYYY-MM-DD IST
+  totalMinutes:   { type: Number, default: 0 },
+  lastHeartbeat:  { type: Date, default: null },
+  messageCount:   { type: Number, default: 0 },
+  taskCount:      { type: Number, default: 0 },
+});
+ActivitySessionSchema.index({ email: 1, dateStr: 1 }, { unique: true });
+const ActivitySession = mongoose.model('ActivitySession', ActivitySessionSchema);
 
 // ── MediaFile schema — separate storage for audio/video with access control ───
 const MediaFileSchema = new mongoose.Schema({
@@ -415,6 +554,12 @@ const MeetingAccessSchema = new mongoose.Schema({
 MeetingAccessSchema.index({ messageId: 1, channelId: 1 }, { unique: true });
 const MeetingAccess = mongoose.model('MeetingAccess', MeetingAccessSchema);
 
+// ── Revoked-email set — populated immediately when admin deletes a user.
+// Blocks their JWT on every subsequent API call without a DB round-trip.
+// Resets on server restart, but deleted users can't log in again (DB record gone)
+// so a new JWT can never be issued to them after restart.
+const revokedEmails = new Set();
+
 // ── Auth middleware ──────────────────────────────────────────────────────────
 function authMiddleware(req, res, next) {
   const authHeader = req.headers.authorization;
@@ -422,6 +567,10 @@ function authMiddleware(req, res, next) {
     try {
       const token = authHeader.slice(7);
       const decoded = jwt.verify(token, JWT_SECRET);
+      // Immediately reject deleted users — their JWT is no longer valid
+      if (revokedEmails.has(decoded.email?.toLowerCase())) {
+        return res.status(401).json({ success: false, error: 'Account removed. Please contact admin.' });
+      }
       req.user = decoded; // { email, name, role }
     } catch (err) {
       // Token invalid — continue without auth, will fall back to query params
@@ -493,7 +642,10 @@ app.post('/api/access-requests', async (req, res) => {
 });
 
 // GET /api/access-requests — admin fetches all requests
-app.get('/api/access-requests', async (req, res) => {
+app.get('/api/access-requests', authMiddleware, async (req, res) => {
+  if (!req.user || req.user.role !== 'Admin') {
+    return res.status(403).json({ success: false, error: 'Admin access required.' });
+  }
   try {
     const requests = await AccessRequest.find({}).sort({ requestedAt: -1 }).lean();
     const formatted = requests.map(({ _id, __v, ...rest }) => ({
@@ -508,7 +660,10 @@ app.get('/api/access-requests', async (req, res) => {
 });
 
 // PATCH /api/access-requests/:id — admin approves, rejects or updates user role/channel
-app.patch('/api/access-requests/:id', async (req, res) => {
+app.patch('/api/access-requests/:id', authMiddleware, async (req, res) => {
+  if (!req.user || req.user.role !== 'Admin') {
+    return res.status(403).json({ success: false, error: 'Admin access required.' });
+  }
   try {
     const { id } = req.params;
     const { status, channelId, channelIds, role } = req.body;
@@ -552,12 +707,31 @@ app.patch('/api/access-requests/:id', async (req, res) => {
   }
 });
 
-// DELETE /api/access-requests/:id — admin removes a request
-app.delete('/api/access-requests/:id', async (req, res) => {
+// DELETE /api/access-requests/:id — admin removes a user
+app.delete('/api/access-requests/:id', authMiddleware, async (req, res) => {
+  if (!req.user || req.user.role !== 'Admin') {
+    return res.status(403).json({ success: false, error: 'Admin access required.' });
+  }
   try {
     const { id } = req.params;
+    // Fetch the user's email BEFORE deleting so we can broadcast it
+    const target = await AccessRequest.findById(id).lean();
+    const removedEmail = target?.email ?? null;
+
     await AccessRequest.findByIdAndDelete(id);
-    res.json({ success: true });
+
+    // Revoke their JWT immediately — all subsequent API calls return 401
+    if (removedEmail) revokedEmails.add(removedEmail.toLowerCase());
+
+    // Broadcast to all connected clients:
+    // 1. member_removed         — removes the row from every member list instantly
+    // 2. user_forcefully_removed — the removed user's UI detects their email and forces logout
+    io.emit('member_removed', { memberId: `member-${id}` });
+    if (removedEmail) {
+      io.emit('user_forcefully_removed', { email: removedEmail.toLowerCase() });
+    }
+
+    res.json({ success: true, removedEmail });
   } catch (err) {
     res.status(500).json({ success: false, error: String(err) });
   }
@@ -710,6 +884,126 @@ app.get('/api/login-history', authMiddleware, async (req, res) => {
     res.json({ success: true, history });
   } catch (err) {
     res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
+// ─── Activity tracking endpoints ──────────────────────────────────────────────
+
+// POST /api/activity/heartbeat — dashboard pings every 60 s while active
+// Adds up to 2 minutes per ping (cap prevents idle tabs from inflating counts).
+app.post('/api/activity/heartbeat', authMiddleware, async (req, res) => {
+  try {
+    const email = req.user?.email?.toLowerCase();
+    const name  = req.user?.name ?? '';
+    if (!email) return res.status(401).json({ success: false });
+
+    const now = new Date();
+    // Build IST date string
+    const istOffset = 5.5 * 60 * 60 * 1000;
+    const istDate = new Date(now.getTime() + istOffset);
+    const dateStr = istDate.toISOString().slice(0, 10);
+
+    const session = await ActivitySession.findOneAndUpdate(
+      { email, dateStr },
+      { $setOnInsert: { email, name, dateStr, totalMinutes: 0, messageCount: 0, taskCount: 0 } },
+      { upsert: true, new: true }
+    );
+
+    // Calculate minutes to add — cap at 2 min per ping regardless of gap
+    let minutesToAdd = 1;
+    if (session.lastHeartbeat) {
+      const gapMs = now - new Date(session.lastHeartbeat);
+      const gapMin = gapMs / 60000;
+      minutesToAdd = Math.min(Math.round(gapMin), 2);
+    }
+
+    await ActivitySession.updateOne(
+      { email, dateStr },
+      { $set: { lastHeartbeat: now, name }, $inc: { totalMinutes: minutesToAdd } }
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
+// GET /api/activity/stats — admin only, returns per-user stats for last 7 days
+app.get('/api/activity/stats', authMiddleware, async (req, res) => {
+  try {
+    if (!req.user || req.user.role !== 'Admin') {
+      return res.status(403).json({ success: false, error: 'Admin only.' });
+    }
+
+    const sevenDaysAgo = new Date();
+    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+    const istOffset = 5.5 * 60 * 60 * 1000;
+    const cutoffStr = new Date(sevenDaysAgo.getTime() + istOffset).toISOString().slice(0, 10);
+
+    // Aggregate session time per user over last 7 days
+    const sessions = await ActivitySession.find({ dateStr: { $gte: cutoffStr } }).lean();
+
+    const statsMap = {};
+    sessions.forEach((s) => {
+      if (!statsMap[s.email]) {
+        statsMap[s.email] = {
+          email: s.email,
+          name: s.name,
+          totalMinutes: 0,
+          activeDays: 0,
+          lastSeen: null,
+          messageCount: 0,
+          taskCount: 0,
+        };
+      }
+      const u = statsMap[s.email];
+      u.totalMinutes  += s.totalMinutes  || 0;
+      u.messageCount  += s.messageCount  || 0;
+      u.taskCount     += s.taskCount     || 0;
+      u.activeDays    += 1;
+      if (!u.lastSeen || (s.lastHeartbeat && new Date(s.lastHeartbeat) > new Date(u.lastSeen))) {
+        u.lastSeen = s.lastHeartbeat;
+      }
+    });
+
+    // Also include members who haven't had a session yet (show zeros)
+    const allRequests = await AccessRequest.find({ status: 'approved' }).lean();
+    allRequests.forEach((r) => {
+      if (!statsMap[r.email.toLowerCase()]) {
+        statsMap[r.email.toLowerCase()] = {
+          email: r.email.toLowerCase(),
+          name: r.name,
+          totalMinutes: 0,
+          activeDays: 0,
+          lastSeen: null,
+          messageCount: 0,
+          taskCount: 0,
+        };
+      }
+    });
+
+    res.json({ success: true, stats: Object.values(statsMap) });
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
+// POST /api/activity/message — increments message count for today's session
+app.post('/api/activity/message', authMiddleware, async (req, res) => {
+  try {
+    const email = req.user?.email?.toLowerCase();
+    if (!email) return res.status(401).json({ success: false });
+    const now = new Date();
+    const istOffset = 5.5 * 60 * 60 * 1000;
+    const dateStr = new Date(now.getTime() + istOffset).toISOString().slice(0, 10);
+    await ActivitySession.findOneAndUpdate(
+      { email, dateStr },
+      { $inc: { messageCount: 1 }, $set: { name: req.user?.name ?? '' }, $setOnInsert: { totalMinutes: 0, taskCount: 0, activeDays: 0 } },
+      { upsert: true }
+    );
+    res.json({ success: true });
+  } catch {
+    res.json({ success: true }); // non-critical — never fail a message send
   }
 });
 
@@ -1424,6 +1718,49 @@ function formatMessage(msg, requestingUser) {
   };
 }
 
+// ── OG Link Preview unfurl ───────────────────────────────────────────────────
+app.get('/api/og', async (req, res) => {
+  const url = String(req.query.url || '');
+  if (!url || !/^https?:\/\//i.test(url)) {
+    return res.status(400).json({ success: false, error: 'Valid URL required' });
+  }
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 5000);
+    const resp = await fetch(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; EduTechExOSBot/1.0; +https://edutechexos.vercel.app)' },
+      signal: ctrl.signal,
+    });
+    clearTimeout(timer);
+    const html = await resp.text();
+
+    const og = (prop) => {
+      const m = html.match(new RegExp(`<meta[^>]+property=["']og:${prop}["'][^>]+content=["']([^"']{1,400})["']`, 'i'))
+               || html.match(new RegExp(`<meta[^>]+content=["']([^"']{1,400})["'][^>]+property=["']og:${prop}["']`, 'i'));
+      return m?.[1]?.trim() || '';
+    };
+    const meta = (name) => {
+      const m = html.match(new RegExp(`<meta[^>]+name=["']${name}["'][^>]+content=["']([^"']{1,400})["']`, 'i'))
+               || html.match(new RegExp(`<meta[^>]+content=["']([^"']{1,400})["'][^>]+name=["']${name}["']`, 'i'));
+      return m?.[1]?.trim() || '';
+    };
+    const titleTag = (html.match(/<title[^>]*>([^<]{1,200})<\/title>/i) || [])[1]?.trim() || '';
+
+    res.json({
+      success: true,
+      preview: {
+        url,
+        title:       og('title')       || meta('title')       || titleTag,
+        description: og('description') || meta('description') || '',
+        image:       og('image')       || '',
+        siteName:    og('site_name')   || '',
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
 // GET Messages — supports two modes:
 //   1. ?channelId=X[&before=ISO_TIMESTAMP][&limit=N]  → paginated single-channel
 //   2. (no channelId) → last PAGE_SIZE messages per channel for initial load
@@ -1570,6 +1907,57 @@ app.patch('/api/messages/:id', async (req, res) => {
 
     res.json({ success: true, message: payload });
   } catch (err) {
+    res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
+// ─── Full-text search across messages, wiki pages, and tasks ─────────────────
+// GET /api/search?q=<query>&limit=<n>   (auth required)
+app.get('/api/search', authMiddleware, async (req, res) => {
+  try {
+    const q = String(req.query.q || '').trim();
+    const limit = Math.min(parseInt(req.query.limit) || 20, 50);
+    if (!q) return res.json({ success: true, results: [], total: 0 });
+
+    const textFilter = { $text: { $search: q } };
+    const scoreProj = { score: { $meta: 'textScore' } };
+
+    const [msgDocs, wikiDocs, taskDocs] = await Promise.all([
+      Message.find(textFilter, scoreProj).sort({ score: { $meta: 'textScore' } }).limit(limit).lean(),
+      WikiPage.find(textFilter, scoreProj).sort({ score: { $meta: 'textScore' } }).limit(10).lean(),
+      KanbanTask.find(textFilter, scoreProj).sort({ score: { $meta: 'textScore' } }).limit(10).lean(),
+    ]);
+
+    const results = [
+      ...msgDocs.map(d => ({
+        type: 'message', id: String(d._id), channelId: d.channelId,
+        text: d.text, sender: d.sender, timestamp: d.timestamp, score: d.score,
+      })),
+      ...wikiDocs.map(d => ({
+        type: 'wiki', id: String(d._id), channelId: d.channelId,
+        text: `${d.title}: ${String(d.content).replace(/<[^>]*>/g, '').slice(0, 200)}`,
+        sender: d.createdBy, timestamp: d.updatedAt, score: d.score,
+      })),
+      ...taskDocs.map(d => ({
+        type: 'task', id: String(d._id), channelId: d.sourceChannel,
+        text: `${d.text} → ${d.assignee} [${d.status}]`,
+        sender: d.assignee, timestamp: d.createdAt, score: d.score,
+      })),
+    ].sort((a, b) => (b.score ?? 0) - (a.score ?? 0)).slice(0, limit);
+
+    res.json({ success: true, results, total: results.length });
+  } catch (err) {
+    // If text index doesn't exist yet, fall back to regex search
+    if (String(err).includes('text index')) {
+      const q = String(req.query.q || '').trim();
+      const re = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+      const msgs = await Message.find({ text: re }).limit(20).lean();
+      return res.json({
+        success: true,
+        results: msgs.map(d => ({ type: 'message', id: String(d._id), channelId: d.channelId, text: d.text, sender: d.sender, timestamp: d.timestamp })),
+        total: msgs.length,
+      });
+    }
     res.status(500).json({ success: false, error: String(err) });
   }
 });
@@ -1835,8 +2223,11 @@ app.post('/api/email', async (req, res) => {
       return res.status(400).json({ success: false, error: 'to, subject, htmlContent are required' });
     }
     const recipients = Array.isArray(to) ? to : [{ email: String(to) }];
-    const { ok } = await sendBrevoEmail({ to: recipients, subject, html: htmlContent });
-    if (!ok) return res.status(502).json({ success: false, error: 'Brevo send failed' });
+    const result = await sendBrevoEmail({ to: recipients, subject, html: htmlContent });
+    if (!result.ok) {
+      console.error('[/api/email] Brevo rejected the request:', result.brevoError);
+      return res.status(502).json({ success: false, error: result.brevoError ?? 'Brevo send failed' });
+    }
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ success: false, error: String(err) });
