@@ -1169,6 +1169,63 @@ app.post('/api/members/:id/promote-admin', authMiddleware, async (req, res) => {
   }
 });
 
+// POST /api/admin/broadcast-email — admin sends a custom email to every user
+// Sends to all VALID_ACCOUNTS + all approved DB users in one BCC call.
+app.post('/api/admin/broadcast-email', authMiddleware, async (req, res) => {
+  try {
+    if (!req.user || req.user.role !== 'Admin') {
+      return res.status(403).json({ success: false, error: 'Admin access required.' });
+    }
+    const { subject, message } = req.body;
+    if (!subject || !subject.trim()) return res.status(400).json({ success: false, error: 'Subject is required.' });
+    if (!message || !message.trim()) return res.status(400).json({ success: false, error: 'Message is required.' });
+
+    const dbUsers = await AccessRequest.find({ status: 'approved' }).lean().catch(() => []);
+    const allEmails = [
+      ...VALID_ACCOUNTS.map((a) => a.email),
+      ...dbUsers.map((u) => u.email),
+    ];
+
+    if (allEmails.length === 0) {
+      return res.json({ success: false, error: 'No users to send to.' });
+    }
+
+    const appUrl = process.env.APP_URL || 'https://edutechexos.vercel.app';
+    const html = `
+      <div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;padding:32px 24px;background:#FAF8F5;border-radius:12px;">
+        <div style="background:linear-gradient(135deg,#191E2F,#252D45);border-radius:10px;padding:24px;text-align:center;margin-bottom:24px;">
+          <h1 style="color:#fff;margin:0;font-size:22px;letter-spacing:-0.5px;">EduTechExOS</h1>
+          <p style="color:rgba(255,255,255,0.6);margin:6px 0 0;font-size:13px;">Message from Admin</p>
+        </div>
+        <div style="background:#fff;border:1px solid rgba(62,74,137,0.12);border-radius:10px;padding:20px 24px;margin-bottom:20px;">
+          <p style="white-space:pre-wrap;font-size:14px;color:#1E2636;line-height:1.7;margin:0;">${message.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</p>
+        </div>
+        <div style="text-align:center;margin:20px 0;">
+          <a href="${appUrl}" style="display:inline-block;background:#3E4A89;color:#fff;text-decoration:none;padding:12px 28px;border-radius:10px;font-size:13px;font-weight:700;">Open EduTechExOS →</a>
+        </div>
+        <hr style="border:none;border-top:1px solid rgba(62,74,137,0.10);margin:20px 0;" />
+        <p style="color:#B0B8D1;font-size:11px;text-align:center;margin:0;">EduTechExOS · Sent by workspace admin</p>
+      </div>`;
+
+    const [primary, ...rest] = allEmails;
+    const r = await sendBrevoEmail({
+      to: [{ email: primary }],
+      bcc: rest.length > 0 ? rest.map(e => ({ email: e })) : undefined,
+      subject: subject.trim(),
+      html,
+    });
+
+    if (!r.ok) {
+      return res.status(502).json({ success: false, error: `Email provider error: ${r.brevoError}` });
+    }
+
+    console.log(`[broadcast] Admin ${req.user.email} sent "${subject.trim()}" to ${allEmails.length} users.`);
+    res.json({ success: true, sentTo: allEmails.length });
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
 // POST /api/meeting-access — create/get meeting access record
 app.post('/api/meeting-access', authMiddleware, async (req, res) => {
   try {
