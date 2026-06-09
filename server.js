@@ -813,9 +813,14 @@ app.delete('/api/access-requests/:id', authMiddleware, async (req, res) => {
   }
   try {
     const { id } = req.params;
-    // Fetch the user's email BEFORE deleting so we can broadcast it
+    // Fetch the user BEFORE deleting so we can broadcast their email.
+    // If they don't exist, return 404 — a silent "success" on a missing record
+    // would cause the frontend to remove from UI while the DB record stays intact.
     const target = await AccessRequest.findById(id).lean();
-    const removedEmail = target?.email ?? null;
+    if (!target) {
+      return res.status(404).json({ success: false, error: 'User not found. They may have already been removed.' });
+    }
+    const removedEmail = target.email;
 
     await AccessRequest.findByIdAndDelete(id);
 
@@ -826,9 +831,7 @@ app.delete('/api/access-requests/:id', authMiddleware, async (req, res) => {
     // 1. member_removed         — removes the row from every member list instantly
     // 2. user_forcefully_removed — the removed user's UI detects their email and forces logout
     io.emit('member_removed', { memberId: `member-${id}` });
-    if (removedEmail) {
-      io.emit('user_forcefully_removed', { email: removedEmail.toLowerCase() });
-    }
+    io.emit('user_forcefully_removed', { email: removedEmail.toLowerCase() });
 
     res.json({ success: true, removedEmail });
   } catch (err) {
