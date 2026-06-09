@@ -65,7 +65,9 @@ const JWT_SECRET = process.env.JWT_SECRET || 'edutechexos-jwt-secret-2026';
 const JWT_EXPIRY = '7d';
 
 // ── Brevo HTTP API helper (no SMTP / no IP whitelist needed) ─────────────────
-async function sendBrevoEmail({ to, subject, html }) {
+// Supports: to (array of {email,name?}), bcc (optional array), subject, html.
+// Use bcc for bulk sends — one API call, one email credit, no cross-leakage.
+async function sendBrevoEmail({ to, bcc, subject, html }) {
   const apiKey = process.env.BREVO_API_KEY;
   if (!apiKey) { console.error('[Brevo] BREVO_API_KEY not set'); return { ok: false }; }
 
@@ -73,18 +75,25 @@ async function sendBrevoEmail({ to, subject, html }) {
   const fromEmail = (fromRaw.match(/<(.+)>/) || [])[1] || fromRaw.trim();
   const fromName  = fromRaw.replace(/<.*>/, '').trim() || 'EduTechExOS';
 
-  console.log(`[Brevo] Sending "${subject}" from ${fromEmail} to ${Array.isArray(to) ? to.map(r => r.email).join(', ') : to}`);
+  const toList = Array.isArray(to) ? to : [{ email: String(to) }];
+  const bccCount = Array.isArray(bcc) ? bcc.length : 0;
+  const totalRecipients = toList.length + bccCount;
+  console.log(`[Brevo] Sending "${subject}" → ${totalRecipients} recipient(s)`);
+
+  const payload = { sender: { name: fromName, email: fromEmail }, to: toList, subject, htmlContent: html };
+  if (Array.isArray(bcc) && bcc.length > 0) payload.bcc = bcc;
+
   const res = await fetch('https://api.brevo.com/v3/smtp/email', {
     method: 'POST',
     headers: { 'api-key': apiKey, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ sender: { name: fromName, email: fromEmail }, to, subject, htmlContent: html }),
+    body: JSON.stringify(payload),
   });
   if (!res.ok) {
     const b = await res.text();
     console.error('[Brevo] FAILED', res.status, b);
     return { ok: false, brevoError: `${res.status}: ${b}` };
   }
-  console.log(`[Brevo] OK — delivered to ${Array.isArray(to) ? to.length : 1} recipient(s)`);
+  console.log(`[Brevo] OK — queued for ${totalRecipients} recipient(s)`);
   return { ok: true };
 }
 
@@ -309,12 +318,23 @@ cron.schedule('30 2 * * *', async () => {
         </div>
       </div>`;
 
-    let sent = 0;
-    for (const email of allEmails) {
-      const r = await sendBrevoEmail({ to: [{ email }], subject: `EduTechExOS Daily Digest — ${dateLabel}`, html });
-      if (r.ok) sent++;
-    }
-    console.log(`[digest] Sent to ${sent}/${allEmails.length} users.`);
+    if (allEmails.length === 0) { console.log('[digest] No users to email.'); return; }
+
+    // Send ONE Brevo API call with all recipients in BCC.
+    // Benefits vs. N individual calls:
+    //   • Uses 1 email credit (not N) — avoids hitting the free-plan daily limit
+    //   • One rate-limit slot instead of N — no partial sends
+    //   • All users get it or none do — no "some received, some didn't"
+    //   • BCC means recipients can't see each other's addresses
+    const [primaryEmail, ...restEmails] = allEmails;
+    const bccList = restEmails.map(e => ({ email: e }));
+    const r = await sendBrevoEmail({
+      to: [{ email: primaryEmail }],
+      bcc: bccList.length > 0 ? bccList : undefined,
+      subject: `EduTechExOS Daily Digest — ${dateLabel}`,
+      html,
+    });
+    console.log(`[digest] ${r.ok ? `Sent to all ${allEmails.length} users.` : `FAILED: ${r.brevoError}`}`);
   } catch (err) {
     console.error('[digest] Error:', err);
   }
