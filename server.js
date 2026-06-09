@@ -1670,10 +1670,7 @@ app.post('/api/digest', async (req, res) => {
 });
 
 // ── Cron: send digest daily at 09:00 IST = 03:30 UTC ─────────────────────────
-// Uses node-cron for reliable scheduling that survives restarts and doesn't
-// drift like the old setTimeout approach.
-const cron = require('node-cron');
-
+// Uses node-cron (required at top of file) for reliable scheduling.
 cron.schedule('30 3 * * *', async () => {
   console.log('[digest-cron] Firing daily digest at 03:30 UTC (09:00 IST)');
   try {
