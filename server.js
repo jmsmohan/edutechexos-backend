@@ -628,6 +628,53 @@ app.post('/api/access-requests', async (req, res) => {
     const request = new AccessRequest({ name, email: emailClean, password, role });
     const saved = await request.save();
     const { _id, __v, ...rest } = saved.toObject();
+
+    // ── Email 1: confirmation to the applicant ─────────────────────────────
+    sendBrevoEmail({
+      to: [{ email: emailClean, name }],
+      subject: 'EduTechExOS — We received your access request',
+      html: `
+        <div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;padding:32px 24px;background:#FAF8F5;border-radius:12px;">
+          <div style="background:linear-gradient(135deg,#191E2F,#252D45);border-radius:10px;padding:24px;text-align:center;margin-bottom:24px;">
+            <h1 style="color:#fff;margin:0;font-size:22px;letter-spacing:-0.5px;">EduTechExOS</h1>
+            <p style="color:rgba(255,255,255,0.6);margin:6px 0 0;font-size:13px;">Team Operating System</p>
+          </div>
+          <h2 style="color:#1E2636;font-size:18px;margin:0 0 12px;">Hi ${name}, your request is under review 👋</h2>
+          <p style="color:#4A5578;font-size:14px;line-height:1.6;margin:0 0 16px;">
+            Thanks for requesting access to <strong>EduTechExOS</strong>. Your request has been received and is now waiting for admin approval.
+          </p>
+          <div style="background:#fff;border:1px solid rgba(62,74,137,0.12);border-radius:10px;padding:16px;margin-bottom:20px;">
+            <p style="margin:0 0 8px;font-size:12px;font-weight:700;color:#9BA6D3;text-transform:uppercase;letter-spacing:1px;">Your request details</p>
+            <p style="margin:4px 0;font-size:13px;color:#4A5578;"><strong>Name:</strong> ${name}</p>
+            <p style="margin:4px 0;font-size:13px;color:#4A5578;"><strong>Email:</strong> ${emailClean}</p>
+            <p style="margin:4px 0;font-size:13px;color:#4A5578;"><strong>Role requested:</strong> ${role}</p>
+          </div>
+          <p style="color:#7C859E;font-size:13px;line-height:1.5;">You will receive another email once the admin reviews your request. This usually takes 1–2 business days.</p>
+          <hr style="border:none;border-top:1px solid rgba(62,74,137,0.10);margin:24px 0;" />
+          <p style="color:#B0B8D1;font-size:11px;text-align:center;margin:0;">EduTechExOS · Powered by EduTechEx</p>
+        </div>`,
+    }).catch(() => {});
+
+    // ── Email 2: alert to the admin ────────────────────────────────────────
+    const adminEmail = (VALID_ACCOUNTS.find(a => a.role === 'Admin') || {}).email;
+    if (adminEmail) {
+      sendBrevoEmail({
+        to: [{ email: adminEmail }],
+        subject: `EduTechExOS — New access request from ${name}`,
+        html: `
+          <div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;padding:32px 24px;">
+            <h2 style="color:#1E2636;">New access request</h2>
+            <p style="color:#4A5578;font-size:14px;">A new user has requested access to EduTechExOS.</p>
+            <div style="background:#F7F6F2;border-radius:8px;padding:16px;margin:16px 0;">
+              <p style="margin:4px 0;font-size:13px;"><strong>Name:</strong> ${name}</p>
+              <p style="margin:4px 0;font-size:13px;"><strong>Email:</strong> ${emailClean}</p>
+              <p style="margin:4px 0;font-size:13px;"><strong>Role:</strong> ${role}</p>
+            </div>
+            <p style="color:#4A5578;font-size:13px;">Log in to the admin panel to approve or reject this request.</p>
+          </div>`,
+      }).catch(() => {});
+    }
+
     res.json({
       success: true,
       request: {
@@ -692,6 +739,58 @@ app.patch('/api/access-requests/:id', authMiddleware, async (req, res) => {
         channelIds: rest.channelIds || [],
         status: rest.status,
       });
+    }
+
+    // ── Email notifications on approval / rejection ────────────────────────
+    const appUrl = process.env.APP_URL || 'https://edutechexos.vercel.app';
+    if (status === 'approved') {
+      sendBrevoEmail({
+        to: [{ email: rest.email, name: rest.name }],
+        subject: '🎉 EduTechExOS — Your access has been approved!',
+        html: `
+          <div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;padding:32px 24px;background:#FAF8F5;border-radius:12px;">
+            <div style="background:linear-gradient(135deg,#191E2F,#252D45);border-radius:10px;padding:24px;text-align:center;margin-bottom:24px;">
+              <h1 style="color:#fff;margin:0;font-size:22px;letter-spacing:-0.5px;">EduTechExOS</h1>
+              <p style="color:rgba(255,255,255,0.6);margin:6px 0 0;font-size:13px;">Team Operating System</p>
+            </div>
+            <h2 style="color:#1E2636;font-size:20px;margin:0 0 12px;">Welcome aboard, ${rest.name}! 🚀</h2>
+            <p style="color:#4A5578;font-size:14px;line-height:1.6;margin:0 0 20px;">
+              Your access to <strong>EduTechExOS</strong> has been approved by the admin. You can now sign in and start collaborating with the team.
+            </p>
+            <div style="background:#fff;border:1px solid rgba(62,74,137,0.12);border-radius:10px;padding:16px;margin-bottom:20px;">
+              <p style="margin:0 0 8px;font-size:12px;font-weight:700;color:#9BA6D3;text-transform:uppercase;letter-spacing:1px;">Your login credentials</p>
+              <p style="margin:4px 0;font-size:13px;color:#4A5578;"><strong>Email:</strong> ${rest.email}</p>
+              <p style="margin:4px 0;font-size:13px;color:#4A5578;"><strong>Password:</strong> The one you set when you signed up</p>
+              <p style="margin:4px 0;font-size:13px;color:#4A5578;"><strong>Role:</strong> ${rest.role}</p>
+            </div>
+            <div style="text-align:center;margin:24px 0;">
+              <a href="${appUrl}/sign-up-login-screen" style="display:inline-block;background:#3E4A89;color:#fff;text-decoration:none;padding:14px 32px;border-radius:10px;font-size:14px;font-weight:700;letter-spacing:0.3px;">Sign In to EduTechExOS →</a>
+            </div>
+            <p style="color:#9BA6D3;font-size:12px;text-align:center;">If you have any questions, reach out to your workspace admin.</p>
+            <hr style="border:none;border-top:1px solid rgba(62,74,137,0.10);margin:24px 0;" />
+            <p style="color:#B0B8D1;font-size:11px;text-align:center;margin:0;">EduTechExOS · Powered by EduTechEx</p>
+          </div>`,
+      }).catch(() => {});
+    } else if (status === 'rejected') {
+      sendBrevoEmail({
+        to: [{ email: rest.email, name: rest.name }],
+        subject: 'EduTechExOS — Update on your access request',
+        html: `
+          <div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;padding:32px 24px;background:#FAF8F5;border-radius:12px;">
+            <div style="background:linear-gradient(135deg,#191E2F,#252D45);border-radius:10px;padding:24px;text-align:center;margin-bottom:24px;">
+              <h1 style="color:#fff;margin:0;font-size:22px;letter-spacing:-0.5px;">EduTechExOS</h1>
+            </div>
+            <h2 style="color:#1E2636;font-size:18px;margin:0 0 12px;">Hi ${rest.name},</h2>
+            <p style="color:#4A5578;font-size:14px;line-height:1.6;margin:0 0 16px;">
+              Thank you for your interest in <strong>EduTechExOS</strong>. After review, the admin was unable to approve your access request at this time.
+            </p>
+            <p style="color:#4A5578;font-size:14px;line-height:1.6;margin:0 0 16px;">
+              If you believe this was a mistake or would like to discuss further, please contact your workspace admin directly.
+            </p>
+            <hr style="border:none;border-top:1px solid rgba(62,74,137,0.10);margin:24px 0;" />
+            <p style="color:#B0B8D1;font-size:11px;text-align:center;margin:0;">EduTechExOS · Powered by EduTechEx</p>
+          </div>`,
+      }).catch(() => {});
     }
 
     res.json({
